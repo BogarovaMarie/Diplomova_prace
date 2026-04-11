@@ -33,18 +33,27 @@ def send_at_command(cmd):
         sock.connect((AT_IP, AT_PORT))
         sock.sendall((cmd + "\n").encode())
 
-        sock.settimeout(2)
-        data = sock.recv(4096)
+        sock.settimeout(5)  # delší timeout
+
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data.decode(errors="ignore"))
+            except socket.timeout:
+                break
+
         sock.close()
 
-        if not data:
+        if not chunks:
             return "(žádná odpověď)"
 
-        return data.decode(errors="ignore").strip()
+        return "".join(chunks).strip()
 
     except Exception as e:
         return f"CHYBA spojení s emulátorem: {e}"
-
 
 # ---------------------------------------------------------
 # GUI

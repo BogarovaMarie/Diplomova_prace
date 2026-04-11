@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 import json
+import math
 
 # -----------------------------
 # KONSTANTY
@@ -19,12 +20,14 @@ timers = []
 global_state = {
     "rsrp": -100,
     "band": "B20",
-    "cereg_n": 0,          # režim URC
-    "cereg_stat": 0,       # poslední stav registrace
-    "tac": "9488",         # Tracking Area Code
-    "ci": "94EC9",      # Cell ID
-    "act": 9,               # 9 = NB-IoT
-    "cfun":1               # 1 registrován rádio
+    "cereg_n": 0,               # režim URC
+    "cereg_stat": 0,            # poslední stav registrace
+    "tac": "9488",              # Tracking Area Code
+    "ci": "94EC9",              # Cell ID
+    "act": 9,                   # 9 = NB-IoT
+    "iotopmode": 1,             # aktuální RAT (1 = NB-IoT)
+    "iotopmode_pending": None,  # hodnota, která se aplikuje po restartu
+    "cfun":1                    # 1 registrován rádio
 }
 
 # -----------------------------
@@ -42,6 +45,18 @@ class Timer:
             self.expired = True
             if self.callback:
                 self.callback()
+
+# -----------------------------
+# FUNKCE PRO PLÁNOVANÉ ODPOVĚDI ("ZPOŽDĚNÍ")
+# -----------------------------
+def schedule_response(conn, response, delay):
+        def callback():
+            try:
+                conn.sendall((response + "\n").encode())
+            except:
+                pass
+
+        timers.append(Timer(delay, callback))
 
     # -----------------------------
     # CEREG
@@ -63,7 +78,7 @@ def send_cereg_urc(stat):
         except:
             pass
 
-
+## toto by se mělo přepočítávat pro všechny parametry pro QCSQ vyzkoušet a zapsat
 # -----------------------------
 # AT PŘÍKAZY – LOGIKA
 # -----------------------------
@@ -75,18 +90,96 @@ def convert_rsrp_to_rssi(rsrp):
     if rsrp > -110: return 5
     return 0
 
+def calculate_rsrq(rsrp_dbm, rssi_dbm, N=1):
+    rsrp_mw = 10 ** (rsrp_dbm / 10)
+    rssi_mw = 10 ** (rssi_dbm / 10)
+    rsrq_linear = (N * rsrp_mw) / rssi_mw
+    rsrq_db = 10 * math.log10(rsrq_linear)
+    return round(rsrq_db, 1)
+
+# nevím jak to definovat, můžu to zkust aproximovat takto?
+def estimate_sinr(rssi):
+    if rssi <= -100:
+        return 119
+    if rssi <= -98:
+        return 134
+    if rssi <= -93:
+        return 193
+
+
+
+# Propisování Band do AT příkazů nápověda v GUI.py poznámka dole
+# chci tam switch case pro 4 typy příkazů, nebude v tom zmatek?
 
 def evaluate_at_command(cmd):
     cmd = cmd.strip().upper()
 
-    if cmd == "AT":
-        return "OK"
+    if cmd in ("AT", "ATE"):
+        return {"delay": 0.8, "response": "OK"}
 
-    if cmd == "ATE":
-        return "OK"
+    if cmd=="AT+GMI":
+        return {"now": "AT+GMI<CR> \n Quectel \n \n OK"}
+
+    if cmd == "AT+CGMI":
+        return {"now": "AT+CGMI<CR> \n Quectel \n \n OK"}
+
+    if cmd == "AT+GMM":
+        return {"now": "AT+GMM<CR> \n BG77 \n \n OK"}
+
+    if cmd == "AT+CGMM":
+        return {"now": "AT+CGMM<CR> \n BG77 \n \n OK"}
+
+    if cmd == "AT+GSN":
+        return {"now": "AT + GSN < CR > \n 866349045095357 \n \n OK"}
+
+    if cmd == "ATI":
+        return {"now": "ATI<CR> \n Quectel \n BG77 \n Revision: BG77LAR02A04 \n \n OK"}
 
     if cmd == "AT+QCSQ":
-        return f'+QCSQ: "NBIOT",{convert_rsrp_to_rssi(global_state["rsrp"])},{global_state["rsrp"]},119,-8\nOK'
+        rssi = convert_rsrp_to_rssi(global_state["rsrp"])
+        rsrp = global_state["rsrp"]
+        sinr = estimate_sinr(rssi)
+        rsrq = calculate_rsrq(rsrp, rssi)
+
+        resp = f'+QCSQ: "NBIOT",{rssi},{rsrp},{sinr},{rsrq}\nOK'
+        return {"delay": 0.4, "response": resp}
+
+    # ---------------------------------------------------------
+    # AT+QCFG="iotopmode"
+    # ---------------------------------------------------------
+    if cmd.startswith('AT+QCFG="IOTOPMODE"'):
+        parts = cmd.split(",")
+
+        # dotaz bez parametrů
+        if len(parts) == 1:
+            mode = global_state["iotopmode"]
+            pending = global_state["iotopmode_pending"]
+            if pending is None:
+                return {"now": f'+QCFG: "iotopmode",{mode},1\nOK'}
+            else:
+                return {"now": f'+QCFG: "iotopmode",{pending},0\nOK'}
+
+        # nastavení dvou parametrů
+        try:
+            mode = int(parts[1])
+            apply_now = int(parts[2])
+
+            if mode not in (0, 1) or apply_now not in (0, 1):
+                return {"now": "ERROR"}
+
+            if apply_now == 1:
+                # aplikovat ihned
+                global_state["iotopmode"] = mode
+                global_state["act"] = 9 if mode == 1 else 8
+                global_state["iotopmode_pending"] = None
+            else:
+                # uložit, ale neaplikovat
+                global_state["iotopmode_pending"] = mode
+
+            return {"delay": 0.5, "response": "OK"}
+
+        except:
+            return {"now": "ERROR"}
 
     if cmd.startswith("AT+CFUN="):
         try:
@@ -101,6 +194,7 @@ def evaluate_at_command(cmd):
     if cmd == "AT+CEREG=?":
         return f'+CEREG: (0-2,4)\nOK'
 
+    #Error má taky různé stupně upovídanosti, zapracovat taky do kódu?
     # ---------------------------------------------------------
     # AT+CEREG=<n>  (nastavení URC režimu)
     # ---------------------------------------------------------
@@ -136,13 +230,18 @@ def evaluate_at_command(cmd):
         global_state["cereg_stat"] = stat
 
         if n == 0:
-            return f'+CEREG: 0,{stat}\nOK'
-        if n == 1:
-            return f'+CEREG: 1,{stat}\nOK'
-        if n == 2:
-            return f'+CEREG: 2,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\nOK'
-        if n == 4:
-            return f'+CEREG: 4,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"],",,,,"}\nOK'
+            resp = f'+CEREG: 0,{stat}\nOK'
+        elif n == 1:
+            resp = f'+CEREG: 1,{stat}\nOK'
+        elif n == 2:
+            resp = f'+CEREG: 2,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\nOK'
+        elif n == 4:
+            resp = f'+CEREG: 4,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]},,,,\nOK'
+
+        return {"delay": 1.5, "response": resp}
+
+## Odesílá přes socket s jiným portem než settings (AT_PORT, AT_SETTINGS_PORT)
+#musí se to předávat JSONem? tady se to předává bez toho...
 # -----------------------------
 # VLÁKNO 1 – AT SOCKET
 # -----------------------------
@@ -167,8 +266,13 @@ def at_thread():
 
                 response = evaluate_at_command(cmd)
 
+                result = evaluate_at_command(cmd)
+
                 with mutex:
-                    conn.sendall((response + "\n").encode())
+                    if "now" in result:
+                        conn.sendall((result["now"] + "\n").encode())
+                    elif "delay" in result:
+                        schedule_response(conn, result["response"], result["delay"])
 
             except:
                 break
@@ -176,6 +280,7 @@ def at_thread():
         conn.close()
         print("[AT] Client disconnected")
 
+#Nějaké další parametry?
 # -----------------------------
 # VLÁKNO 2 – SETTINGS SOCKET
 # -----------------------------
@@ -215,7 +320,7 @@ def settings_thread():
       #      global_state["cereg_stat"] = new_stat
        #     send_cereg_urc(new_stat)
 
-
+## timer zatím neaplikován, potřebuji, aby to vypisovalo zpoždění podle printscreenů, resp. realizovalo v AT příkazech
 # -----------------------------
 # VLÁKNO 0 – MAIN (TIMERS)
 # -----------------------------
