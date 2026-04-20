@@ -55,6 +55,8 @@ if __name__ == "__main__":
         json_data = json.loads(data.decode())  # Převede přijatá data z JSON formátu na slovník
         print(json_data)
         rsrp = json_data.get("rsrp", "---")
+        rssi = json_data.get("rssi", "---")
+        sinr = json_data.get("sinr", "---")
         band = json_data.get("band", "---")
         print(f" RSRP: {json_data['rsrp']} band: {json_data['band']}")
          # udelej neco s daty

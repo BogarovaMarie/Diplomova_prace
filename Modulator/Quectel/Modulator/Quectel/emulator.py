@@ -19,6 +19,8 @@ at_clients = []
 timers = []
 global_state = {
     "rsrp": -100,
+    "rssi": -90,
+    "sinr": 10,
     "band": "B20",
     "cereg_n": 0,               # režim URC
     "cereg_stat": 0,            # poslední stav registrace
@@ -27,7 +29,8 @@ global_state = {
     "act": 9,                   # 9 = NB-IoT
     "iotopmode": 1,             # aktuální RAT (1 = NB-IoT)
     "iotopmode_pending": None,  # hodnota, která se aplikuje po restartu
-    "cfun":1                    # 1 registrován rádio
+    "cfun":1,                   # 1 registrován rádio
+    "sockets": {}               # slovník otevřených socketů: connect_id -> socket_info
 }
 
 # -----------------------------
@@ -52,7 +55,7 @@ class Timer:
 def schedule_response(conn, response, delay):
         def callback():
             try:
-                conn.sendall((response + "\n").encode())
+                conn.sendall((response + "\r\n").encode())
             except:
                 pass
 
@@ -68,9 +71,9 @@ def send_cereg_urc(stat):
         return  # URC vypnuto
 
     if n == 1:
-        msg = f'+CEREG: {stat}\n'
+        msg = f'+CEREG: {stat}\r\n'
     else:
-        msg = f'+CEREG: {stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\n'
+        msg = f'+CEREG: {stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\r\n'
 
     for conn in at_clients:
         try:
@@ -82,66 +85,129 @@ def send_cereg_urc(stat):
 # -----------------------------
 # AT PŘÍKAZY – LOGIKA
 # -----------------------------
-def convert_rsrp_to_rssi(rsrp):
-    # hrubá simulace
-    if rsrp > -80: return 20
-    if rsrp > -90: return 15
-    if rsrp > -100: return 10
-    if rsrp > -110: return 5
-    return 0
+#def convert_rsrp_to_rssi(rsrp):
+#    # hrubá simulace
+#    if rsrp > -80: return 20
+#    if rsrp > -90: return 15
+#    if rsrp > -100: return 10
+#    if rsrp > -110: return 5
+#    return 0
 
 def calculate_rsrq(rsrp_dbm, rssi_dbm, N=1):
     rsrp_mw = 10 ** (rsrp_dbm / 10)
     rssi_mw = 10 ** (rssi_dbm / 10)
     rsrq_linear = (N * rsrp_mw) / rssi_mw
     rsrq_db = 10 * math.log10(rsrq_linear)
-    return round(rsrq_db, 1)
+    return int(round(rsrq_db))
 
 # nevím jak to definovat, můžu to zkust aproximovat takto?
-def estimate_sinr(rssi):
-    if rssi <= -100:
-        return 119
-    if rssi <= -98:
-        return 134
-    if rssi <= -93:
-        return 193
-
-
+#def estimate_sinr(rssi):
+#    if rssi <= -100:
+#        return 119
+#   if rssi <= -98:
+#        return 134
+#    if rssi <= -93:
+#        return 193
+#    return 200  # default, aby nikdy nevrátil None
 
 # Propisování Band do AT příkazů nápověda v GUI.py poznámka dole
 # chci tam switch case pro 4 typy příkazů, nebude v tom zmatek?
+
+def manage_socket(connect_id, ip_address, remote_port):
+    """Správa socketu v samostatném vlákně"""
+    try:
+        # Vytvoření TCP socketu
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)  # timeout pro připojení
+        
+        print(f"[SOCKET {connect_id}] Connecting to {ip_address}:{remote_port}")
+        
+        # Pokus o připojení
+        sock.connect((ip_address, remote_port))
+        
+        # Aktualizace stavu na connected
+        with mutex:
+            if connect_id in global_state["sockets"]:
+                global_state["sockets"][connect_id]["status"] = "connected"
+                global_state["sockets"][connect_id]["socket"] = sock
+        
+        print(f"[SOCKET {connect_id}] Connected successfully")
+        
+        # Hlavní smyčka pro příjem dat
+        sock.settimeout(1)  # timeout pro recv
+        while True:
+            try:
+                data = sock.recv(1024)
+                if not data:
+                    # Socket byl uzavřen ze strany serveru
+                    break
+                
+                print(f"[SOCKET {connect_id}] Received: {data.decode(errors='ignore')}")
+                
+                # Zde by mohla být logika pro zpracování příchozích dat
+                # Např. odeslání URC +QIRD nebo podobně
+                
+            except socket.timeout:
+                # Timeout - pokračujeme ve smyčce
+                continue
+            except:
+                break
+        
+    except Exception as e:
+        print(f"[SOCKET {connect_id}] Connection failed: {e}")
+        # Aktualizace stavu na failed
+        with mutex:
+            if connect_id in global_state["sockets"]:
+                global_state["sockets"][connect_id]["status"] = "failed"
+    
+    finally:
+        # Uzavření socketu
+        try:
+            sock.close()
+        except:
+            pass
+        
+        # Aktualizace stavu na closed
+        with mutex:
+            if connect_id in global_state["sockets"]:
+                global_state["sockets"][connect_id]["status"] = "closed"
+        
+        print(f"[SOCKET {connect_id}] Socket closed")
 
 def evaluate_at_command(cmd):
     cmd = cmd.strip().upper()
 
     if cmd in ("AT", "ATE"):
-        return {"delay": 0.8, "response": "OK"}
+        return {"delay": 0.206, "response": "OK"}
 
     if cmd=="AT+GMI":
-        return {"now": "AT+GMI<CR> \n Quectel \n \n OK"}
+        return {"now": "AT+GMI<CR>\nQuectel\r\n\r\nOK"}
 
     if cmd == "AT+CGMI":
-        return {"now": "AT+CGMI<CR> \n Quectel \n \n OK"}
+        return {"now": "AT+CGMI<CR>\nQuectel\r\n\r\nOK"}
 
     if cmd == "AT+GMM":
-        return {"now": "AT+GMM<CR> \n BG77 \n \n OK"}
+        return {"now": "AT+GMM<CR>\nBG77\r\n\r\nOK"}
 
     if cmd == "AT+CGMM":
-        return {"now": "AT+CGMM<CR> \n BG77 \n \n OK"}
+        return {"now": "AT+CGMM\r\nBG77\r\n\r\nOK"}
 
     if cmd == "AT+GSN":
-        return {"now": "AT + GSN < CR > \n 866349045095357 \n \n OK"}
+        return {"now": "AT+GSN<CR>\r\n866349045095357\r\n\r\nOK"}
 
     if cmd == "ATI":
-        return {"now": "ATI<CR> \n Quectel \n BG77 \n Revision: BG77LAR02A04 \n \n OK"}
+        return {"now": "ATI<CR>\nQuectel\r\nBG77\r\nRevision: BG77LAR02A04\r\n\r\nOK"}
+
+    if cmd == 'AT+QCFG="band"':
+        return {"delay": 0.077, "response": '+QCFG: "band",0x0,0x80084,0x80084\r\n\r\nOK'}
 
     if cmd == "AT+QCSQ":
-        rssi = convert_rsrp_to_rssi(global_state["rsrp"])
+        rssi = global_state["rssi"]
         rsrp = global_state["rsrp"]
-        sinr = estimate_sinr(rssi)
+        sinr = global_state["sinr"]
         rsrq = calculate_rsrq(rsrp, rssi)
 
-        resp = f'+QCSQ: "NBIOT",{rssi},{rsrp},{sinr},{rsrq}\nOK'
+        resp = f'+QCSQ: "NBIOT",{rssi},{rsrp},{sinr},{rsrq}\r\nOK'
         return {"delay": 0.4, "response": resp}
 
     # ---------------------------------------------------------
@@ -155,9 +221,9 @@ def evaluate_at_command(cmd):
             mode = global_state["iotopmode"]
             pending = global_state["iotopmode_pending"]
             if pending is None:
-                return {"now": f'+QCFG: "iotopmode",{mode},1\nOK'}
+                return {"now": f'+QCFG: "iotopmode",{mode},1\r\nOK'}
             else:
-                return {"now": f'+QCFG: "iotopmode",{pending},0\nOK'}
+                return {"now": f'+QCFG: "iotopmode",{pending},0\r\nOK'}
 
         # nastavení dvou parametrů
         try:
@@ -176,23 +242,42 @@ def evaluate_at_command(cmd):
                 # uložit, ale neaplikovat
                 global_state["iotopmode_pending"] = mode
 
-            return {"delay": 0.5, "response": "OK"}
+            return {"delay": 0.955, "response": "OK"}
 
         except:
             return {"now": "ERROR"}
 
+    # ---------------------------------------------------------
+    # AT+CFUN=?  (dotaz na podporované režimy)
+    # ---------------------------------------------------------
+    if cmd == "AT+CFUN=?":
+        resp = '+CFUN: (0,1,4),(0,1)\r\nOK'
+        return {"delay": 0.079, "response": resp}
+
+    # ---------------------------------------------------------
+    # AT+CFUN=<mode>  (nastavení režimu)
+    # ---------------------------------------------------------
     if cmd.startswith("AT+CFUN="):
         try:
             mode = int(cmd.split("=")[1])
             if mode in (0, 1):
                 global_state["cfun"] = mode
-                return "OK"
-            return "ERROR"
+                return {"delay": 0.140, "response": f"AT+CFUN={mode}\r\nOK"}
+            return {"now": "ERROR"}
         except:
-            return "ERROR"
+            return {"now": "ERROR"}
+
+    # ---------------------------------------------------------
+    # AT+CFUN?  (dotaz na aktuální režim)
+    # ---------------------------------------------------------
+    if cmd == "AT+CFUN?":
+        mode = global_state["cfun"]
+        resp = f'+CFUN: {mode}\r\n OK'
+        return {"delay": 0.032, "response": resp}
 
     if cmd == "AT+CEREG=?":
-        return f'+CEREG: (0-2,4)\nOK'
+        resp= f'+CEREG: (0-2,4)\r\n OK'
+        return {"delay": 0.079, "response": resp}
 
     #Error má taky různé stupně upovídanosti, zapracovat taky do kódu?
     # ---------------------------------------------------------
@@ -230,15 +315,107 @@ def evaluate_at_command(cmd):
         global_state["cereg_stat"] = stat
 
         if n == 0:
-            resp = f'+CEREG: 0,{stat}\nOK'
+            resp = f'+CEREG: 0,{stat}\r\nOK'
         elif n == 1:
-            resp = f'+CEREG: 1,{stat}\nOK'
+            resp = f'+CEREG: 1,{stat}\r\nOK'
         elif n == 2:
-            resp = f'+CEREG: 2,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\nOK'
+            resp = f'+CEREG: 2,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]}\r\nOK'
         elif n == 4:
-            resp = f'+CEREG: 4,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]},,,,\nOK'
+            resp = f'+CEREG: 4,{stat},{global_state["tac"]},{global_state["ci"]},{global_state["act"]},,,,\r\nOK'
 
-        return {"delay": 1.5, "response": resp}
+        return {"delay": 0.032, "response": resp}
+
+    # ---------------------------------------------------------
+    # AT+QIOPEN  (otevření socketu)
+    # ---------------------------------------------------------
+    if cmd.startswith("AT+QIOPEN="):
+        try:
+            # Parsování parametrů: AT+QIOPEN=<contextID>,<connectID>,<service_type>,<IP_address>,<remote_port>
+            params = cmd.split("=")[1].split(",")
+            if len(params) >= 5:
+                context_id = int(params[0])
+                connect_id = int(params[1])
+                service_type = params[2].strip('"')
+                ip_address = params[3].strip('"')
+                remote_port = int(params[4])
+                
+                # Kontrola, zda connect_id není již použit
+                if connect_id in global_state["sockets"]:
+                    return {"now": "ERROR"}
+                
+                # Spuštění socket vlákna pro tento connect_id
+                socket_thread = threading.Thread(target=manage_socket, args=(connect_id, ip_address, remote_port), daemon=True)
+                socket_thread.start()
+                
+                # Uložení informace o otevřeném socketu do globálního stavu
+                global_state["sockets"][connect_id] = {
+                    "context_id": context_id,
+                    "service_type": service_type,
+                    "ip_address": ip_address,
+                    "remote_port": remote_port,
+                    "status": "connecting"
+                }
+                
+                print(f"[QIOPEN] Opening socket: context={context_id}, connect={connect_id}, type={service_type}, ip={ip_address}:{remote_port}")
+                
+                # Odpověď s URC +QIOPEN a pak OK
+                urc_response = f'+QIOPEN: {connect_id},0\r\n'
+                return {"delay": 1.0, "response": urc_response + "OK"}
+            else:
+                return {"now": "ERROR"}
+        except:
+            return {"now": "ERROR"}
+
+    # ---------------------------------------------------------
+    # AT+QISEND  (odeslání dat přes socket)
+    # ---------------------------------------------------------
+    if cmd.startswith("AT+QISEND="):
+        try:
+            # Parsování parametrů: AT+QISEND=<connectID>,<send_length>
+            params = cmd.split("=")[1].split(",")
+            if len(params) >= 2:
+                connect_id = int(params[0])
+                send_length = int(params[1])
+                
+                # Kontrola, zda socket existuje a je připojen
+                if connect_id not in global_state["sockets"] or global_state["sockets"][connect_id]["status"] != "connected":
+                    return {"now": "ERROR"}
+                
+                # V emulátoru jednoduše potvrdíme přijetí příkazu
+                # V reálném modemu by zde čekal na data k odeslání
+                return {"delay": 0.1, "response": ">"}
+            else:
+                return {"now": "ERROR"}
+        except:
+            return {"now": "ERROR"}
+
+    # ---------------------------------------------------------
+    # AT+QICLOSE  (zavření socketu)
+    # ---------------------------------------------------------
+    if cmd.startswith("AT+QICLOSE="):
+        try:
+            # Parsování parametrů: AT+QICLOSE=<connectID>
+            connect_id = int(cmd.split("=")[1])
+            
+            # Kontrola, zda socket existuje
+            if connect_id not in global_state["sockets"]:
+                return {"now": "ERROR"}
+            
+            # Uzavření socketu
+            try:
+                if "socket" in global_state["sockets"][connect_id]:
+                    global_state["sockets"][connect_id]["socket"].close()
+            except:
+                pass
+            
+            # Aktualizace stavu
+            global_state["sockets"][connect_id]["status"] = "closed"
+            
+            print(f"[QICLOSE] Closed socket {connect_id}")
+            
+            return {"delay": 0.2, "response": "OK"}
+        except:
+            return {"now": "ERROR"}
 
 ## Odesílá přes socket s jiným portem než settings (AT_PORT, AT_SETTINGS_PORT)
 #musí se to předávat JSONem? tady se to předává bez toho...
@@ -270,7 +447,7 @@ def at_thread():
 
                 with mutex:
                     if "now" in result:
-                        conn.sendall((result["now"] + "\n").encode())
+                        conn.sendall((result["now"] + "\r\n").encode())
                     elif "delay" in result:
                         schedule_response(conn, result["response"], result["delay"])
 
@@ -302,6 +479,8 @@ def settings_thread():
 
                 with mutex:
                     global_state["rsrp"] = json_data.get("rsrp", global_state["rsrp"])
+                    global_state["rssi"] = json_data.get("rssi", global_state["rssi"])
+                    global_state["sinr"] = json_data.get("sinr", global_state["sinr"])
                     global_state["band"] = json_data.get("band", global_state["band"])
 
                 print("[SETTINGS] Updated state:", global_state)

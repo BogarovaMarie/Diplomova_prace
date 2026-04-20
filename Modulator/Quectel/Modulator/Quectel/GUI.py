@@ -184,24 +184,24 @@ def main():
 
     tk.Button(ram, text="AT+QCSQ", command=lambda: pridat_prikaz("AT+QCSQ")).place(x=750, y=50, anchor=tk.N)
 
-# AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
+    # rozdíl opproti QCSQ? AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
 
-    #   AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
-    # AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
-    # AT+QCSQ  Query and Report Signal Strength RSRP
+    # ještě není AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
+    # tam je AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
+    # tam je AT+QCSQ  Query and Report Signal Strength RSRP
 
-    #   AT + QCFG = "band" Band Configuration
-    # AT + QNWINFO Query Network Information
-    #     AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
+    # ještě není  AT + QCFG = "band" Band Configuration
+    # ještě není AT + QNWINFO Query Network Information
+    # ještě není AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
     # NB-IoT
-    #  AT + QCFG = "nccconf" Configure NB - IoT Features
+    # ještě není AT + QCFG = "nccconf" Configure NB - IoT Features
 
-    #AT + COPS Operator Selection
+    # ještě není AT + COPS Operator Selection
 
-    #AT + CEDRXS e - I - DRX Setting
-    #AT + CEDRXRDP Read Dynamic Parameters
+    # ještě není AT + CEDRXS e - I - DRX Setting
+    # ještě není AT + CEDRXRDP Read Dynamic Parameters
 
-    #ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
+    # ještě není ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
 
     # Spustí smyčku Thinker
     root.mainloop()
