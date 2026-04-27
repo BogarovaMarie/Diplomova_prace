@@ -19,3 +19,11 @@ def slider_zmena(event):
     stitek_hodnota = tk.Label(okno, text="Výkon přijatého referenčního signálu (RSRP): -60")
     stitek_hodnota.place(x=200, y=170, anchor=tk.N)
 
+    info_label = tk.Label(okno, text=" i ", fg="white", bg="blue", font=("Arial", 10, "bold"))
+    info_label.place(x=380, y=140)
+
+    ToolTip(info_label,
+            text="Možné hodnoty:\n\n"
+                 "GSM: 900, 1800 MHz\n"
+                 "LTE: B1, B3, B7, B20\n"
+                 "NR: n1, n3, n28, n78")

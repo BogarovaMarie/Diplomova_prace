@@ -2,9 +2,21 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
 from tkinter import*
+import socket
+import json
 import Backend_Quectel_Server
 
+REMOTE_IP = "127.0.0.1"
+REMOTE_PORT = 65000
 
+#---------------------------------------------------------
+ #SOCKET KLIENT
+ #---------------------------------------------------------
+def odesli_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((REMOTE_IP, REMOTE_PORT))
+    print("Server běží na 127.0.0.1:65000 (non-blocking)")
+    sock.close()
 
 #pouze okno pro zobrazeni akce, varování atd.
 def kliknuti_na_tlacitko():
@@ -26,6 +38,10 @@ def main():
     # Rám pro lepší uspořádání
     ram = ttk.Frame(root)
     ram.pack(fill="both", expand=True)
+
+    # ---------------------------------------------------------
+    # OKNO NASTAVENÍ
+    # ---------------------------------------------------------
 
     def otevrit_nastaveni():
         """Otevře nové okno s nastavením."""
@@ -57,12 +73,28 @@ def main():
         cislo_pasma.pack(pady=5)
 
         def ulozit():
+            rsrp_value = RSRP.get()
+            band_value = cislo_pasma.get()
+
+            Backend_Quectel_Server.uloz_nastaveni(rsrp_value, band_value)
+
+            # ODESLÁNÍ DO DRUHÉ APLIKACE
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect(("127.0.0.1", 65000))  # MUSÍ odpovídat serveru
+                data = {"rsrp": rsrp_value, "band": band_value}
+                sock.sendall(json.dumps(data).encode())
+                sock.close()
+            except Exception as e:
+                print("Chyba socketu:", e)
+
+            messagebox.showinfo("Info", "Nastavení uloženo a odesláno.")
             # uložíme hodnoty do instance Backend_Quectel_Server
-            backend=Backend_Quectel_Server()
-            backend.uloz_nastaveni(RSRP.get(), cislo_pasma.get())
+            Backend_Quectel_Server.uloz_nastaveni(rsrp_value, band_value)
             messagebox.showinfo(
                 "Info",
-                f"Nastavení uloženo\nRSRP: {backend.rsrp}\nČíslo pásma: {backend.band}"
+                f"Nastavení uloženo\nRSRP: {Backend_Quectel_Server.rsrp}\nČíslo pásma: {Backend_Quectel_Server.band}"
+
             )
 
         tk.Button(nastaveni, text="Uložit", command=ulozit).pack(pady=5)
@@ -108,12 +140,17 @@ def main():
     vystup = tk.Text(ramecek, wrap="word", height=10, state="disabled", font=("Arial", 10))
     vystup.pack(fill="both", expand=True)
 
+    # ---------------------------------------------------------
+    # FUNKCE PRO ODESÍLÁNÍ PŘÍKAZŮ
+    # ---------------------------------------------------------
     # Univerzální funkce
     def pridat_prikaz(cmd):
         vystup.config(state="normal")
         vystup.insert(tk.END, cmd + "\n")
+
         response = Backend_Quectel_Server.get_odpoved(cmd)
         vystup.insert(tk.END, response + "\n")
+
         vystup.config(state="disabled")
         vstup.delete(0, tk.END)
 
@@ -147,30 +184,32 @@ def main():
 
     tk.Button(ram, text="AT+QCSQ", command=lambda: pridat_prikaz("AT+QCSQ")).place(x=750, y=50, anchor=tk.N)
 
-# AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
+    # rozdíl opproti QCSQ? AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
 
-    #   AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
-    # AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
-    # AT+QCSQ  Query and Report Signal Strength RSRP
+    # ještě není AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
+    # tam je AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
+    # tam je AT+QCSQ  Query and Report Signal Strength RSRP
 
-    #   AT + QCFG = "band" Band Configuration
-    # AT + QNWINFO Query Network Information
-    #     AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
-    # NB-IoT
-    #  AT + QCFG = "nccconf" Configure NB - IoT Features
+    # je, ale nefunguje možná vynechat?  AT + QCFG = "band" Band Configuration
+    # je AT + QNWINFO Query Network Information
+    # ještě není AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
+    # NB-IoT moc nevím, co to vlastně dělá, asi jen něco vrací podle návodu
+    # ještě není AT + QCFG = "nccconf" Configure NB - IoT Features
 
-    #AT + COPS Operator Selection
+    # je AT + COPS Operator Selection
+    # AT+CEREG 4 pokud je v PSM módu, mám implementovat i všechny tři PSM módy?
+    # ještě není AT + CEDRXS e - I - DRX Setting
+    # ještě není AT + CEDRXRDP Read Dynamic Parameters
 
-    #AT + CEDRXS e - I - DRX Setting
-    #AT + CEDRXRDP Read Dynamic Parameters
-
-    #ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
+    # ještě není ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
 
     # Spustí smyčku Thinker
     root.mainloop()
 
+
 if __name__ == "__main__":
     try:
+        #odesli_socket()
         main()
     except Exception as e:
         print(f"An error occurred: {e}")
