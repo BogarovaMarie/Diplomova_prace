@@ -190,14 +190,14 @@ def main():
     # tam je AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
     # tam je AT+QCSQ  Query and Report Signal Strength RSRP
 
-    # ještě není  AT + QCFG = "band" Band Configuration
-    # ještě není AT + QNWINFO Query Network Information
+    # je, ale nefunguje možná vynechat?  AT + QCFG = "band" Band Configuration
+    # je AT + QNWINFO Query Network Information
     # ještě není AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
-    # NB-IoT
+    # NB-IoT moc nevím, co to vlastně dělá, asi jen něco vrací podle návodu
     # ještě není AT + QCFG = "nccconf" Configure NB - IoT Features
 
-    # ještě není AT + COPS Operator Selection
-
+    # je AT + COPS Operator Selection
+    # AT+CEREG 4 pokud je v PSM módu, mám implementovat i všechny tři PSM módy?
     # ještě není AT + CEDRXS e - I - DRX Setting
     # ještě není AT + CEDRXRDP Read Dynamic Parameters
 

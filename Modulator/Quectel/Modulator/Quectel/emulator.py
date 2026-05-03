@@ -3,6 +3,9 @@ import threading
 import time
 import json
 import math
+import subprocess
+import re
+import platform
 
 # -----------------------------
 # KONSTANTY
@@ -21,7 +24,8 @@ global_state = {
     "rsrp": -100,
     "rssi": -90,
     "sinr": 10,
-    "band": "B20",
+    "ber":0,
+    "band": "BAND 20",
     "cereg_n": 0,               # režim URC
     "cereg_stat": 0,            # poslední stav registrace
     "tac": "9488",              # Tracking Area Code
@@ -30,6 +34,9 @@ global_state = {
     "iotopmode": 1,             # aktuální RAT (1 = NB-IoT)
     "iotopmode_pending": None,  # hodnota, která se aplikuje po restartu
     "cfun":1,                   # 1 registrován rádio
+    "mcc": "230",               # Mobile Country Code (Česká republika)
+    "mnc": "02",                # Mobile Network Code (O2)
+    "exec_mode": "NBIoT",       # NBIoT/eMTC
     "sockets": {}               # slovník otevřených socketů: connect_id -> socket_info
 }
 
@@ -113,72 +120,140 @@ def calculate_rsrq(rsrp_dbm, rssi_dbm, N=1):
 # Propisování Band do AT příkazů nápověda v GUI.py poznámka dole
 # chci tam switch case pro 4 typy příkazů, nebude v tom zmatek?
 
-def manage_socket(connect_id, ip_address, remote_port):
-    """Správa socketu v samostatném vlákně"""
+def get_ping_response(ip_address, timeout_ms):
+    """
+    Provede ping a vrátí reply_time v ms a TTL
+    Funguje na Windows i Linuxu/macOS
+    """
+    system = platform.system()  # 'Windows', 'Linux', 'Darwin' (macOS)
+
     try:
-        # Vytvoření TCP socketu
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)  # timeout pro připojení
-        
+        if system == 'Windows':
+            # Správné pořadí na Windows: ping -n 1 -w timeout ip
+            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip_address]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=max(10, timeout_ms / 1000 + 5))
+            output = result.stdout
+
+            # Parsování Windows výstupu: "time=50ms TTL=64"
+            time_match = re.search(r"time\s*=\s*(\d+)\s*ms", output, re.IGNORECASE)
+            ttl_match = re.search(r"TTL\s*=\s*(\d+)", output, re.IGNORECASE)
+
+            if time_match:
+                reply_time = int(time_match.group(1))
+                ttl = int(ttl_match.group(1)) if ttl_match else 64
+                return reply_time, ttl
+            return None, None
+
+        else:  # Linux, macOS
+            # Linux/macOS příkaz: ping -c 1 -W timeout_ms ip
+            timeout_sec = max(10, timeout_ms / 1000 + 5)
+            cmd = ["ping", "-c", "1", "-W", str(timeout_sec), ip_address]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+            output = result.stdout
+
+            # Parsování Linux výstupu: "time=50.1 ms" a "ttl=64"
+            time_match = re.search(r"time[<=]*([0-9.]+)\s*ms", output)
+            ttl_match = re.search(r"ttl[<=]*([0-9]+)", output, re.IGNORECASE)
+
+            if time_match:
+                reply_time = int(float(time_match.group(1)))
+                ttl = int(ttl_match.group(1)) if ttl_match else 64
+                return reply_time, ttl
+            return None, None
+    except Exception as e:
+        print(f"Ping error: {e}")
+        return None, None
+
+def manage_socket(connect_id, ip_address, remote_port, service_type="TCP"):
+    try:
+        if service_type.upper() == "UDP":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # UDP je bez spojení, není potřeba connect, ale můžete použít sock.connect pro default cíl
+            # sock.connect((ip_address, remote_port))
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((ip_address, remote_port))
+
         print(f"[SOCKET {connect_id}] Connecting to {ip_address}:{remote_port}")
-        
-        # Pokus o připojení
-        sock.connect((ip_address, remote_port))
-        
-        # Aktualizace stavu na connected
+        #sock.connect((ip_address, remote_port))
+
         with mutex:
             if connect_id in global_state["sockets"]:
                 global_state["sockets"][connect_id]["status"] = "connected"
                 global_state["sockets"][connect_id]["socket"] = sock
-        
+                global_state["sockets"][connect_id]["recv_buffer"] = b""  # ← NOVÉ
+
         print(f"[SOCKET {connect_id}] Connected successfully")
-        
-        # Hlavní smyčka pro příjem dat
-        sock.settimeout(1)  # timeout pro recv
+
+        sock.settimeout(1)
         while True:
             try:
                 data = sock.recv(1024)
                 if not data:
-                    # Socket byl uzavřen ze strany serveru
                     break
-                
-                print(f"[SOCKET {connect_id}] Received: {data.decode(errors='ignore')}")
-                
-                # Zde by mohla být logika pro zpracování příchozích dat
-                # Např. odeslání URC +QIRD nebo podobně
-                
+
+                print(f"[SOCKET {connect_id}] Received {len(data)} bytes: {data.decode(errors='ignore')}")
+
+                 # ← NOVÉ: Uložit data do bufferu místo jen vypisování
+                with mutex:
+                    if connect_id in global_state["sockets"]:
+                        global_state["sockets"][connect_id]["recv_buffer"] += data
+
+                    # Volitelně: odeslat URC +QIRD , že jsou nová data
+                    # for conn in at_clients:
+                    #     try:
+                    #         conn.sendall(f"+QIRD: {connect_id},{len(data)}\r\n".encode())
+                    #     except:
+                    #         pass
             except socket.timeout:
-                # Timeout - pokračujeme ve smyčce
                 continue
             except:
                 break
-        
+
     except Exception as e:
         print(f"[SOCKET {connect_id}] Connection failed: {e}")
-        # Aktualizace stavu na failed
         with mutex:
             if connect_id in global_state["sockets"]:
                 global_state["sockets"][connect_id]["status"] = "failed"
-    
+
     finally:
-        # Uzavření socketu
         try:
             sock.close()
         except:
             pass
-        
-        # Aktualizace stavu na closed
+
         with mutex:
             if connect_id in global_state["sockets"]:
                 global_state["sockets"][connect_id]["status"] = "closed"
-        
+
         print(f"[SOCKET {connect_id}] Socket closed")
 
 def evaluate_at_command(cmd):
     cmd = cmd.strip().upper()
+    # ---------------------------------------------------------
+    # AT+CSQ - report o kvalitě signálu
+    # ---------------------------------------------------------
+    if cmd == "AT+CSQ":
+        # RSSI převod z dBm na index podle 3GPP TS 27.007
+        rssi_dbm = global_state.get("rssi", -90)
+        if rssi_dbm <= -113:
+            rssi_val = 0
+        elif rssi_dbm >= -51:
+            rssi_val = 31
+        else:
+            # 2 až 30: -109 až -53 dBm, krok 2 dBm
+            rssi_val = int(round((rssi_dbm + 113) / 2))
+            if rssi_val < 0:
+                rssi_val = 0
+            elif rssi_val > 31:
+                rssi_val = 31
+        ber_val = global_state.get("ber", 0)# BER v procentech, 0 = <0.2%
+        resp = f'+CSQ: {rssi_val},{ber_val}\r\nOK'
+        return {"now": resp}
 
     if cmd in ("AT", "ATE"):
-        return {"delay": 0.206, "response": "OK"}
+        return {"delay": 0.206, "response": "\r\n\r\nOK"}
 
     if cmd=="AT+GMI":
         return {"now": "AT+GMI<CR>\nQuectel\r\n\r\nOK"}
@@ -207,8 +282,33 @@ def evaluate_at_command(cmd):
         sinr = global_state["sinr"]
         rsrq = calculate_rsrq(rsrp, rssi)
 
-        resp = f'+QCSQ: "NBIOT",{rssi},{rsrp},{sinr},{rsrq}\r\nOK'
+        resp = f'+QCSQ: "NBIOT",{rssi},{rsrp},{sinr},{rsrq}\r\n\r\nOK'
         return {"delay": 0.4, "response": resp}
+
+    # ---------------------------------------------------------
+    # AT+QNWINFO - Network Information
+    # ---------------------------------------------------------
+    if cmd.startswith("AT+QNWINFO"):
+        if cmd.endswith("=?"):
+             # Testovací príkaz
+            return {"now": '\r\nOK'}
+        elif cmd.endswith("?") or cmd == "AT+QNWINFO":
+            # Dotazovací a prováděcí - vrátí aktuální stav sítě
+            # Mapování exec_mode: 1 = eMTC, 2 = NB-IoT (podle global_state["iotopmode"])
+            iotopmode = global_state.get("iotopmode", 1)
+            exec_mode_str = "eMTC" if iotopmode == 0 else "NBIoT"
+            band_str = global_state.get("band", '"LTE" band 20')
+            # MCC-MNC kombinace (230=CZ, 02=O2, 03=T-Mobile, itd.)
+            mcc_mnc = global_state.get("mcc", "230") + global_state.get("mnc", "02")
+
+            # Pseudo-náhodné číslo (může být PCI nebo jiný identifikátor)
+            import random
+            cell_id_num = int(global_state.get("ci", "94EC9"), 16) % 10000
+
+            resp = f'+QNWINFO: "{exec_mode_str}","{mcc_mnc}","{band_str}",{cell_id_num}\r\n\r\nOK'
+            return {"now": resp}
+        else:
+            return {"now": "ERROR"}
 
     # ---------------------------------------------------------
     # AT+QCFG="iotopmode"
@@ -221,9 +321,9 @@ def evaluate_at_command(cmd):
             mode = global_state["iotopmode"]
             pending = global_state["iotopmode_pending"]
             if pending is None:
-                return {"now": f'+QCFG: "iotopmode",{mode},1\r\nOK'}
+                return {"now": f'+QCFG: "iotopmode",{mode},1\r\n\r\nOK'}
             else:
-                return {"now": f'+QCFG: "iotopmode",{pending},0\r\nOK'}
+                return {"now": f'+QCFG: "iotopmode",{pending},0\r\n\r\nOK'}
 
         # nastavení dvou parametrů
         try:
@@ -242,10 +342,41 @@ def evaluate_at_command(cmd):
                 # uložit, ale neaplikovat
                 global_state["iotopmode_pending"] = mode
 
-            return {"delay": 0.955, "response": "OK"}
+            return {"delay": 0.955, "response": "\r\n\r\nOK"}
 
         except:
             return {"now": "ERROR"}
+
+        # ---------------------------------------------------------
+        # AT+COPS - výběr operátora
+        # ---------------------------------------------------------
+    if cmd.startswith("AT+COPS"):
+        if cmd.endswith("=?"):
+            # Testovací příkaz: AT+COPS=?
+            # Vrací seznam dostupných režimů a operátorů (zde zjednodušeně)
+            return {
+                    "now": '+COPS: (2,"O2-CZ","O2-CZ","23002",9),(1,"T-Mobile CZ","TMO CZ","23001",9),(0,"Vodafone CZ","VDF CZ","23003",9)\r\n\r\nOK'}
+        elif cmd.endswith("?"):
+            # Dotazovací příkaz: AT+COPS?
+            # Vrací aktuální nastavení (zde zjednodušeně)
+            # Příklad: +COPS: 0,0,"O2-CZ",9
+            return {"now": '+COPS: 1,0,"Vodafone",act\r\nOK'}
+        elif "=" in cmd:
+            # Nastavovací příkaz: AT+COPS=<mode>[,<format>[,<oper>[,<act>]]]
+            # Zpracování parametrů (zde pouze validace a simulace)
+            try:
+                params = cmd.split("=")[1].split(",")
+                mode = int(params[0])
+                # Další parametry lze zpracovat dle potřeby
+                # Např. format, oper, act
+                # Zde pouze simulace úspěšného nastavení
+                return {"now": "OK"}
+            except:
+                return {"now": "ERROR"}
+        else:
+            # Prováděcí příkaz: AT+COPS
+            # Vrací základní informace (zde zjednodušeně)
+            return {"now": '+COPS: 1,0,"Vodafone",act\r\nOK'}
 
     # ---------------------------------------------------------
     # AT+CFUN=?  (dotaz na podporované režimy)
@@ -325,9 +456,49 @@ def evaluate_at_command(cmd):
 
         return {"delay": 0.032, "response": resp}
 
+#netuším, jestli modem opravdu takto počítá celevel, ale můžu to zkusit aproximovat podle RSRP, aby se to nějak měnilo a nebylo to pořád stejné, když se změní RSRP v nastavení
+    if cmd == 'AT+QCFG="celevel"':
+        # Odvození celevel podle RSRP
+        rsrp = global_state.get("rsrp", -100)
+        if rsrp > -110:
+            celevel = 0  # nejlepší pokrytí
+        elif rsrp > -120:
+            celevel = 1
+        else:
+            celevel = 2
+        return {"now": f'+QCFG: "celevel",{celevel}\r\nOK'}
+
+    if cmd.startswith("AT+QPING"):
+        if cmd.endswith("=?"):
+            return {"now": '+(<contextID>),(<IP>),(<timeout>),(<pingnum>)\r\nOK'}
+        elif "=" in cmd:
+            try:
+                parts = cmd.split("=")[1].split(",")
+                if len(parts) >= 2:
+                    ip_address = parts[1].strip().strip('"')
+                    timeout = int(parts[2]) if len(parts) > 2 else 4000  # ms
+                    ping_num = int(parts[3]) if len(parts) > 3 else 1
+
+                    # Vrátit speciální instrukci pro naplánování
+                    return {
+                        "ping_sequence": {
+                            "ip_address": ip_address,
+                            "timeout": timeout,
+                            "ping_num": ping_num
+                        }
+                    }
+                else:
+                    return {"now": "ERROR"}
+            except Exception as e:
+                print("Ping error:", e)
+                return {"now": "ERROR"}
+        else:
+            return {"now": "ERROR"}
+
     # ---------------------------------------------------------
     # AT+QIOPEN  (otevření socketu)
     # ---------------------------------------------------------
+    #AT+QIOPEN=1,1,"TCP LISTENER","127.0.0.1",0,2020,0 může to mít i více parametrů
     if cmd.startswith("AT+QIOPEN="):
         try:
             # Parsování parametrů: AT+QIOPEN=<contextID>,<connectID>,<service_type>,<IP_address>,<remote_port>
@@ -344,7 +515,11 @@ def evaluate_at_command(cmd):
                     return {"now": "ERROR"}
                 
                 # Spuštění socket vlákna pro tento connect_id
-                socket_thread = threading.Thread(target=manage_socket, args=(connect_id, ip_address, remote_port), daemon=True)
+                socket_thread = threading.Thread(
+                    target=manage_socket,
+                    args=(connect_id, ip_address, remote_port, service_type),
+                    daemon=True
+                )
                 socket_thread.start()
                 
                 # Uložení informace o otevřeném socketu do globálního stavu
@@ -353,7 +528,8 @@ def evaluate_at_command(cmd):
                     "service_type": service_type,
                     "ip_address": ip_address,
                     "remote_port": remote_port,
-                    "status": "connecting"
+                    "status": "connecting",
+                    "recv_buffer": b""  # Inicializace bufferu
                 }
                 
                 print(f"[QIOPEN] Opening socket: context={context_id}, connect={connect_id}, type={service_type}, ip={ip_address}:{remote_port}")
@@ -407,15 +583,70 @@ def evaluate_at_command(cmd):
                     global_state["sockets"][connect_id]["socket"].close()
             except:
                 pass
-            
+
+            with mutex:
+                del global_state["sockets"][connect_id]
             # Aktualizace stavu
-            global_state["sockets"][connect_id]["status"] = "closed"
+           # global_state["sockets"][connect_id]["status"] = "closed"
             
             print(f"[QICLOSE] Closed socket {connect_id}")
             
             return {"delay": 0.2, "response": "OK"}
         except:
             return {"now": "ERROR"}
+        # ---------------------------------------------------------
+        # AT+QIRD  (čtení dat ze socketu)
+        # ---------------------------------------------------------
+    if cmd.startswith("AT+QIRD="):
+        try:
+            # Parsování: AT+QIRD=<connectID>[,<requestLength>]
+            params = cmd.split("=")[1].split(",")
+            connect_id = int(params[0])
+            request_length = int(params[1]) if len(params) > 1 else 1500  # Default: 1500 bytů
+
+            # Kontrola, zda socket existuje
+            if connect_id not in global_state["sockets"]:
+                return {"now": "ERROR"}
+
+            socket_info = global_state["sockets"][connect_id]
+
+            # Pokud socket není connected, vrať ERROR
+            if socket_info.get("status") != "connected":
+                return {"now": "ERROR"}
+
+            # Čtení dat z bufferu
+            with mutex:
+                recv_buffer = socket_info.get("recv_buffer", b"")
+
+                # Převezmi maximálně request_length bytů
+                data_to_read = recv_buffer[:request_length]
+
+                # Aktualizuj buffer
+                remaining_data = recv_buffer[request_length:]
+                socket_info["recv_buffer"] = remaining_data
+
+            # Vrátit data nebo "OK" pokud žádná nejsou
+            if not data_to_read:
+                return {"now": "+QIRD: 0\r\n\r\nOK"}
+
+             # Převod dat na string (UTF-8 s fallbackem na ignore)
+            data_str = data_to_read.decode(errors='ignore')
+
+            # Odpověď: +QIRD: <délka_dat>
+            #          <data>
+            #          OK
+            resp = f'+QIRD: {len(data_to_read)}\r\n{data_str}\r\n\r\nOK'
+            return {"now": resp}
+
+        except Exception as e:
+            print(f"[QIRD] Error: {e}")
+            return {"now": "ERROR"}
+
+    # ---------------------------------------------------------
+    # AT+QIRD=?  (testovací příkaz - seznam parametrů)
+    # ---------------------------------------------------------
+    if cmd == "AT+QIRD=?":
+        return {"now": '+QIRD: (<connectID>),(<requestLength>)\r\nOK'}
 
 ## Odesílá přes socket s jiným portem než settings (AT_PORT, AT_SETTINGS_PORT)
 #musí se to předávat JSONem? tady se to předává bez toho...
@@ -445,6 +676,46 @@ def at_thread():
 
                 result = evaluate_at_command(cmd)
 
+                if "ping_sequence" in result:
+                    # HNED poslat OK
+                    conn.sendall(b"OK\r\n\r\n")
+
+                    params = result["ping_sequence"]
+                    ip_address = params["ip_address"]
+                    timeout = params["timeout"]
+                    ping_num = params["ping_num"]
+
+                    times = []
+                    ttls = []
+                    sent = ping_num
+                    rcvd = 0
+                    lost = 0
+                    delay_step = 0.15  # zpoždění mezi odpověďmi v sekundách
+
+                    for i in range(ping_num):
+                        reply_time, ttl = get_ping_response(ip_address, timeout)
+                        if reply_time is not None:
+                            times.append(reply_time)
+                            ttls.append(ttl)
+                            rcvd += 1
+                            resp = f'+QPING: 0,"{ip_address}",32,{reply_time},{ttl}'
+                        else:
+                            lost += 1
+                            resp = f'+QPING: 0,"{ip_address}",32,{timeout},0'
+                        schedule_response(conn, resp, delay=(i + 1) * delay_step)
+
+                    # Statistika po posledním pingu
+                    if times:
+                        min_time = min(times)
+                        max_time = max(times)
+                        avg_time = sum(times) // len(times)
+                    else:
+                        min_time = max_time = avg_time = 0
+
+                    stat_resp = f'+QPING: 0,{sent},{rcvd},{lost},{min_time},{max_time},{avg_time}'
+                    schedule_response(conn, stat_resp, delay=(ping_num + 1) * delay_step)
+                    continue  # přeskočte další zpracování, už jste naplánovali odpovědi
+
                 with mutex:
                     if "now" in result:
                         conn.sendall((result["now"] + "\r\n").encode())
@@ -471,24 +742,47 @@ def settings_thread():
         conn, addr = server.accept()
         print("[SETTINGS] Client connected:", addr)
 
-        data = conn.recv(1024)
-        if data:
+        while True:
             try:
+                data = conn.recv(1024)
+                if not data:
+                    break
+
                 json_data = json.loads(data.decode())
-                print("[SETTINGS] Received:", json_data)
+                print("[SETTINGS] Received (raw):", json_data)
+
+                # Normalizujeme klíče na malá písmena pro flexibilitu
+                normalized_data = {k.lower(): v for k, v in json_data.items()}
+                print("[SETTINGS] Received (normalized):", normalized_data)
 
                 with mutex:
-                    global_state["rsrp"] = json_data.get("rsrp", global_state["rsrp"])
-                    global_state["rssi"] = json_data.get("rssi", global_state["rssi"])
-                    global_state["sinr"] = json_data.get("sinr", global_state["sinr"])
-                    global_state["band"] = json_data.get("band", global_state["band"])
+                    # Aktualizujeme jen klíče, které jsou přítomny
+                    if "rsrp" in normalized_data:
+                        global_state["rsrp"] = normalized_data["rsrp"]
+                    if "rssi" in normalized_data:
+                        global_state["rssi"] = normalized_data["rssi"]
+                    if "sinr" in normalized_data:
+                        global_state["sinr"] = normalized_data["sinr"]
+                    if "band" in normalized_data:
+                        global_state["band"] = normalized_data["band"]
 
                 print("[SETTINGS] Updated state:", global_state)
 
-            except json.JSONDecodeError:
-                print("[SETTINGS] Invalid JSON")
+                # Pošli potvrzení
+                conn.sendall(b"OK\r\n")
+
+            except json.JSONDecodeError as e:
+                print("[SETTINGS] Invalid JSON:", e)
+                conn.sendall(b"ERROR\r\n")
+                break
+            except Exception as e:
+                print("[SETTINGS] Exception:", e)
+                break
 
         conn.close()
+        print("[SETTINGS] Client disconnected")
+
+
 #asi nadbytečné!
       #  old_stat = global_state["cereg_stat"]
 
@@ -499,7 +793,6 @@ def settings_thread():
       #      global_state["cereg_stat"] = new_stat
        #     send_cereg_urc(new_stat)
 
-## timer zatím neaplikován, potřebuji, aby to vypisovalo zpoždění podle printscreenů, resp. realizovalo v AT příkazech
 # -----------------------------
 # VLÁKNO 0 – MAIN (TIMERS)
 # -----------------------------
