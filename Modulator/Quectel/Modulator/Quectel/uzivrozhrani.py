@@ -4,8 +4,9 @@ import socket
 import json
 import threading
 import queue
-#pro fungování obrázků v Tkinteru je potřeba nainstalovat Pillow: pip install Pillow
-#from PIL import Image, ImageTk
+
+# pro fungování obrázků v Tkinteru je potřeba nainstalovat Pillow: pip install Pillow
+# from PIL import Image, ImageTk
 
 AT_IP = "127.0.0.1"
 AT_PORT = 50000
@@ -27,14 +28,63 @@ def send_settings(rsrp_value, rssi_value, sinr_value, ber_value, band_value):
     except Exception as e:
         messagebox.showerror("Chyba", f"Nepodařilo se odeslat nastavení:\n{e}")
 
+
 # ---------------------------------------------------------
-# FRONT QUEUE PRO AT PŘÍKAZY
+# FRONTA PRO BĚŽNÉ AT PŘÍKAZY (ASYNCHRONNÍ)
 # ---------------------------------------------------------
 at_queue = queue.Queue()
 
+
 def at_worker():
+    """Vlákno pro asynchronní zpracování běžných AT příkazů"""
     while True:
         cmd, callback = at_queue.get()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((AT_IP, AT_PORT))
+            sock.sendall((cmd + "\n").encode())
+            sock.settimeout(2)
+
+            chunks = []
+            while True:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data.decode(errors="ignore"))
+                except socket.timeout:
+                    break
+
+            sock.close()
+
+            if not chunks:
+                callback("(žádná odpověď)")
+            else:
+                callback("".join(chunks).strip())
+
+        except Exception as e:
+            callback(f"CHYBA spojení s emulátorem: {e}")
+        at_queue.task_done()
+
+
+# Spustit vlákno pro běžné příkazy
+threading.Thread(target=at_worker, daemon=True).start()
+
+
+def send_at_command(cmd, callback):
+    """Asynchronní odeslání běžného AT příkazu"""
+    at_queue.put((cmd, callback))
+
+
+
+def send_qiopen_command(cmd, callback):
+    """Vloží speciální příkaz do fronty (QIOPEN, QICLOSE, QISEND, QIRD)"""
+    qiopen_queue.put((cmd, callback))
+
+qiopen_queue = queue.Queue()
+def qiopen_worker():
+    while True:
+        cmd, callback = qiopen_queue.get()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((AT_IP, AT_PORT))
@@ -49,21 +99,18 @@ def at_worker():
                     chunks.append(data.decode(errors="ignore"))
                 except socket.timeout:
                     break
-            sock.close()
             if not chunks:
                 callback("(žádná odpověď)")
             else:
                 callback("".join(chunks).strip())
         except Exception as e:
             callback(f"CHYBA spojení s emulátorem: {e}")
-        at_queue.task_done()
+        qiopen_queue.task_done()
 
-# Spustit vlákno pro zpracování fronty
-threading.Thread(target=at_worker, daemon=True).start()
+threading.Thread(target=qiopen_worker, daemon=True).start()
 
-def send_at_command_async(cmd, callback):
-    """Vloží AT příkaz do fronty, zpracuje jej worker vlákno."""
-    at_queue.put((cmd, callback))
+
+
 # ---------------------------------------------------------
 # GUI
 # ---------------------------------------------------------
@@ -114,21 +161,9 @@ def main():
         cislo_pasma.insert(0, "band 20")
         cislo_pasma.pack(pady=5)
 
-        # toto asi nutno zakomentovat, pokud není, nainstalován Pilow, zobrazuje obrázek modemu i následující odstavec
-        # ---- OBRÁZEK DESKY ----
-        # Načtení a zmenšení obrázku
-     #   img = Image.open("vez.jpg")  # Změňte na název vašeho souboru
-     #   img = img.resize((150, 100))  # Přizpůsobte velikost dle potřeby
-     #   img_tk = ImageTk.PhotoImage(img)
-
-        # Vytvoření labelu s obrázkem
-     #   obrazek_label = tk.Label(root, image=img_tk)
-     #   obrazek_label.image = img_tk  # Udržet referenci!
-     #   obrazek_label.place(x=200, y=60)  # Umístění vpravo nahoře pod lištu a nad odpovědi
-
         def ulozit():
             rsrp_value = RSRP.get()
-            rssi_value= RSSI.get()
+            rssi_value = RSSI.get()
             sinr_value = SINR.get()
             ber_value = BER.get()
             band_value = cislo_pasma.get().strip()
@@ -143,7 +178,7 @@ def main():
                 "Info",
                 f"Nastavení odesláno do emulátoru.\r\n RSRP: {rsrp_value}\r\n RSSI: {rssi_value} \r\n SINR: {sinr_value} \r\n BER: {ber_value} \r\n Pásmo: {band_value}"
             )
-            
+
             nastaveni.destroy()
 
         tk.Button(nastaveni, text="Uložit", command=ulozit).pack(pady=10)
@@ -178,11 +213,14 @@ def main():
             messagebox.showwarning("Chyba", "Zadej AT příkaz.")
             return
 
-        log(f"{cmd}") #smazáno /r/n
+        log(f"{cmd}")  # HNED se zobrazí příkaz
         vstup.delete(0, tk.END)
 
-        # odpověď přijde později
-        send_at_command_async(cmd, lambda resp: log(resp))
+        # Rozlišení mezi běžným a speciálním příkazem
+        if cmd.startswith("AT+QI"):  # QIOPEN, QICLOSE, QISEND, QIRD
+            send_qiopen_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
+        else:
+            send_at_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
     vstup.bind("<Return>", lambda event: odeslat_vstup())
 
@@ -190,12 +228,12 @@ def main():
 
     # Předdefinovaná tlačítka
     def odeslat_cmd(cmd):
-        log(cmd)
-        send_at_command_async(cmd, lambda resp: log(resp))
+        log(cmd)  # HNED se zobrazí příkaz
+        send_at_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
-    def odeslat_cmd_quiet(cmd):
-        log(f"> {cmd}")
-        send_at_command_async(cmd, lambda resp: log(resp))
+    def odeslat_cmd_special(cmd):
+        log(f"> {cmd}")  # HNED se zobrazí příkaz
+        send_qiopen_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
     tk.Button(ram, text="AT", command=lambda: odeslat_cmd("AT")).place(x=200, y=80, anchor=tk.N)
     tk.Button(ram, text="ATE", command=lambda: odeslat_cmd("ATE")).place(x=250, y=80, anchor=tk.N)
@@ -214,25 +252,12 @@ def main():
     tk.Button(ram, text="AT+CGMM", command=lambda: odeslat_cmd("AT+CGMM")).place(x=340, y=140, anchor=tk.N)
     tk.Button(ram, text="AT+CGMI", command=lambda: odeslat_cmd("AT+CGMI")).place(x=420, y=140, anchor=tk.N)
 
-    # Čtvrtá řada tlačítek
-    tk.Button(ram, text="AT+QIOPEN", command=lambda: odeslat_cmd_quiet('AT+QIOPEN=1,0,"TCP","127.0.0.1",8080')).place(x=200, y=170, anchor=tk.N)
-
-    #toto asi nutno zakomentovat, pokud není, nainstalován Pilow, zobrazuje obrázek modemu i následující odstavec
-    # ---- OBRÁZEK DESKY ----
-    # Načtení a zmenšení obrázku
- #   img = Image.open("board.jpg")  # Změňte na název vašeho souboru
- #   img = img.resize((250, 200))  # Přizpůsobte velikost dle potřeby
- #   img_tk = ImageTk.PhotoImage(img)
-
-    # Vytvoření labelu s obrázkem
- #   obrazek_label = tk.Label(root, image=img_tk)
- #   obrazek_label.image = img_tk  # Udržet referenci!
- #   obrazek_label.place(x=750, y=60)  # Umístění vpravo nahoře pod lištu a nad odpovědi
+    # Čtvrtá řada tlačítek - SPECIÁLNÍ PŘÍKAZY S FRONTOU
+    tk.Button(ram, text="AT+QIOPEN", command=lambda: odeslat_cmd_special('AT+QIOPEN=1,0,"TCP","127.0.0.1",8080')).place(
+        x=200, y=170, anchor=tk.N)
 
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
-#po QUIOPEN má ukazovat tento znak  log(f"> {cmd}")

@@ -6,6 +6,7 @@ import math
 import subprocess
 import re
 import platform
+import queue
 
 # -----------------------------
 # KONSTANTY
@@ -37,7 +38,10 @@ global_state = {
     "mcc": "230",               # Mobile Country Code (Česká republika)
     "mnc": "02",                # Mobile Network Code (O2)
     "exec_mode": "NBIoT",       # NBIoT/eMTC
-    "sockets": {}               # slovník otevřených socketů: connect_id -> socket_info
+    "sockets": {},             # slovník otevřených socketů: connect_id -> socket_info
+    "pdp_contexts": {
+    i: {"state": 0, "type": 1, "ip": ""} for i in range(1, 16)
+}
 }
 
 # -----------------------------
@@ -67,6 +71,26 @@ def schedule_response(conn, response, delay):
                 pass
 
         timers.append(Timer(delay, callback))
+
+# ---------------------------------------------------------
+# FRONTA PRO SOCKET OPERACE (QIOPEN, QISEND, QICLOSE, QIRD)
+# ---------------------------------------------------------
+socket_queue = queue.Queue()
+
+def socket_worker():
+    """Dedikované vlákno pro zpracování socket operací (paralelní, nezávislé)"""
+    while True:
+        cmd = socket_queue.get()
+        try:
+            result = evaluate_at_command(cmd)
+            print(f"[SOCKET_WORKER] Processed: {cmd}")
+            print(f"[SOCKET_WORKER] Result: {result}")
+        except Exception as e:
+            print(f"[SOCKET_WORKER] Error: {e}")
+        socket_queue.task_done()
+
+# Spustit dedikované vlákno pro sockety (PARALELNÍ!)
+threading.Thread(target=socket_worker, daemon=True).start()
 
     # -----------------------------
     # CEREG
@@ -164,70 +188,78 @@ def get_ping_response(ip_address, timeout_ms):
         print(f"Ping error: {e}")
         return None, None
 
+
 def manage_socket(connect_id, ip_address, remote_port, service_type="TCP"):
+    """
+    Spuštěno v separátním vlákně.
+    Simuluje otevření a správu socketu.
+    """
     try:
-        if service_type.upper() == "UDP":
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # UDP je bez spojení, není potřeba connect, ale můžete použít sock.connect pro default cíl
-            # sock.connect((ip_address, remote_port))
-        else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect((ip_address, remote_port))
+        print(f"[SOCKET {connect_id}] Connecting to {service_type} {ip_address}:{remote_port}")
 
-        print(f"[SOCKET {connect_id}] Connecting to {ip_address}:{remote_port}")
-        #sock.connect((ip_address, remote_port))
-
+        # SIMULACE: hned nastavit status na "connected" bez skutečného připojení
+        # (V reálném modemu by se tady skutečně připojilo)
         with mutex:
             if connect_id in global_state["sockets"]:
                 global_state["sockets"][connect_id]["status"] = "connected"
-                global_state["sockets"][connect_id]["socket"] = sock
-                global_state["sockets"][connect_id]["recv_buffer"] = b""  # ← NOVÉ
 
-        print(f"[SOCKET {connect_id}] Connected successfully")
+        print(f"[SOCKET {connect_id}] Connected successfully (simulated)")
 
-        sock.settimeout(1)
-        while True:
-            try:
-                data = sock.recv(1024)
-                if not data:
+        # Pokud chceš skutečné připojení, tento blok:
+        try:
+            if service_type.upper() == "UDP":
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(2)  # krátký timeout
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)  # krátký timeout - aby se nezacyklilo
+                sock.connect((ip_address, remote_port))
+
+            print(f"[SOCKET {connect_id}] Real connection established")
+
+            with mutex:
+                if connect_id in global_state["sockets"]:
+                    global_state["sockets"][connect_id]["socket"] = sock
+
+            # Čtení dat v cyklu
+            sock.settimeout(5)
+            while True:
+                try:
+                    data = sock.recv(1024)
+                    if not data:
+                        break
+
+                    print(f"[SOCKET {connect_id}] Received {len(data)} bytes")
+
+                    with mutex:
+                        if connect_id in global_state["sockets"]:
+                            global_state["sockets"][connect_id]["recv_buffer"] += data
+
+                except socket.timeout:
+                    continue
+                except:
                     break
 
-                print(f"[SOCKET {connect_id}] Received {len(data)} bytes: {data.decode(errors='ignore')}")
+        except socket.timeout:
+            print(f"[SOCKET {connect_id}] Connection timeout (simulace pokračuje)")
+        except Exception as e:
+            print(f"[SOCKET {connect_id}] Real connection failed (simulace pokračuje): {e}")
 
-                 # ← NOVÉ: Uložit data do bufferu místo jen vypisování
-                with mutex:
-                    if connect_id in global_state["sockets"]:
-                        global_state["sockets"][connect_id]["recv_buffer"] += data
-
-                    # Volitelně: odeslat URC +QIRD , že jsou nová data
-                    # for conn in at_clients:
-                    #     try:
-                    #         conn.sendall(f"+QIRD: {connect_id},{len(data)}\r\n".encode())
-                    #     except:
-                    #         pass
-            except socket.timeout:
-                continue
+        finally:
+            try:
+                sock.close()
             except:
-                break
+                pass
 
     except Exception as e:
-        print(f"[SOCKET {connect_id}] Connection failed: {e}")
+        print(f"[SOCKET {connect_id}] Error: {e}")
         with mutex:
             if connect_id in global_state["sockets"]:
                 global_state["sockets"][connect_id]["status"] = "failed"
 
     finally:
-        try:
-            sock.close()
-        except:
-            pass
+        print(f"[SOCKET {connect_id}] Socket handler ended")
 
-        with mutex:
-            if connect_id in global_state["sockets"]:
-                global_state["sockets"][connect_id]["status"] = "closed"
-
-        print(f"[SOCKET {connect_id}] Socket closed")
 
 def evaluate_at_command(cmd):
     cmd = cmd.strip().upper()
@@ -361,18 +393,18 @@ def evaluate_at_command(cmd):
             # Vrací aktuální nastavení (zde zjednodušeně)
             # Příklad: +COPS: 0,0,"O2-CZ",9
             return {"now": '+COPS: 1,0,"Vodafone",act\r\nOK'}
-        elif "=" in cmd:
-            # Nastavovací příkaz: AT+COPS=<mode>[,<format>[,<oper>[,<act>]]]
-            # Zpracování parametrů (zde pouze validace a simulace)
-            try:
-                params = cmd.split("=")[1].split(",")
-                mode = int(params[0])
+  #      elif "=" in cmd:
+  #          # Nastavovací příkaz: AT+COPS=<mode>[,<format>[,<oper>[,<act>]]]
+  #          # Zpracování parametrů (zde pouze validace a simulace)
+  #          try:
+  #              params = cmd.split("=")[1].split(",")
+  #              mode = int(params[0])
                 # Další parametry lze zpracovat dle potřeby
                 # Např. format, oper, act
                 # Zde pouze simulace úspěšného nastavení
-                return {"now": "OK"}
-            except:
-                return {"now": "ERROR"}
+   #             return {"now": "OK"}
+   #         except:
+   #             return {"now": "ERROR"}
         else:
             # Prováděcí příkaz: AT+COPS
             # Vrací základní informace (zde zjednodušeně)
@@ -495,51 +527,117 @@ def evaluate_at_command(cmd):
         else:
             return {"now": "ERROR"}
 
+    # AT+QIACT=?
+    if cmd == "AT+QIACT=?":
+        return {"now": "+QIACT: (1-16)\r\nOK"}
+
+    # AT+QIACT?
+    if cmd == "AT+QIACT?":
+        resp = ""
+        for i in range(1, 16):
+            ctx = global_state["pdp_contexts"][i]
+            if ctx["state"] == 1:
+                resp += f'+QIACT: {i},1,{ctx["type"]},"{ctx["ip"]}"\r\n'
+            else:
+                resp += f'+QIACT: {i},0,{ctx["type"]}\r\n'
+        resp += "OK"
+        return {"now": resp}
+
+    # AT+QIACT=<contextID>
+    if cmd.startswith("AT+QIACT="):
+        try:
+            context_id = int(cmd.split("=")[1])
+            # Zkontroluj limit aktivních kontextů (např. max 2 pro NB2)
+            active = sum(1 for c in global_state["pdp_contexts"].values() if c["state"] == 1)
+            if active >= 2:
+                return {"now": "ERROR"}
+            # Aktivuj kontext
+            ctx = global_state["pdp_contexts"][context_id]
+            ctx["state"] = 1
+            ctx["ip"] = f"10.0.0.{context_id}"
+            return {"now": "OK"}
+        except Exception as e:
+            return {"now": "ERROR"}
+
+    # AT+QIDEACT=<contextID>
+    if cmd.startswith("AT+QIDEACT="):
+        try:
+            context_id = int(cmd.split("=")[1])
+            ctx = global_state["pdp_contexts"][context_id]
+            ctx["state"] = 0
+            ctx["ip"] = ""
+            # Zavři všechny sockety s tímto context_id
+            to_close = [cid for cid, sock in global_state["sockets"].items() if sock.get("context_id") == context_id]
+            for cid in to_close:
+                try:
+                    if "socket" in global_state["sockets"][cid]:
+                        global_state["sockets"][cid]["socket"].close()
+                except:
+                    pass
+                del global_state["sockets"][cid]
+            return {"now": "OK"}
+        except Exception as e:
+            return {"now": "ERROR"}
+
     # ---------------------------------------------------------
     # AT+QIOPEN  (otevření socketu)
     # ---------------------------------------------------------
-    #AT+QIOPEN=1,1,"TCP LISTENER","127.0.0.1",0,2020,0 může to mít i více parametrů
     if cmd.startswith("AT+QIOPEN="):
         try:
-            # Parsování parametrů: AT+QIOPEN=<contextID>,<connectID>,<service_type>,<IP_address>,<remote_port>
-            params = cmd.split("=")[1].split(",")
-            if len(params) >= 5:
-                context_id = int(params[0])
-                connect_id = int(params[1])
-                service_type = params[2].strip('"')
-                ip_address = params[3].strip('"')
-                remote_port = int(params[4])
-                
-                # Kontrola, zda connect_id není již použit
-                if connect_id in global_state["sockets"]:
-                    return {"now": "ERROR"}
-                
-                # Spuštění socket vlákna pro tento connect_id
-                socket_thread = threading.Thread(
-                    target=manage_socket,
-                    args=(connect_id, ip_address, remote_port, service_type),
-                    daemon=True
-                )
-                socket_thread.start()
-                
-                # Uložení informace o otevřeném socketu do globálního stavu
-                global_state["sockets"][connect_id] = {
-                    "context_id": context_id,
-                    "service_type": service_type,
-                    "ip_address": ip_address,
-                    "remote_port": remote_port,
-                    "status": "connecting",
-                    "recv_buffer": b""  # Inicializace bufferu
-                }
-                
-                print(f"[QIOPEN] Opening socket: context={context_id}, connect={connect_id}, type={service_type}, ip={ip_address}:{remote_port}")
-                
-                # Odpověď s URC +QIOPEN a pak OK
-                urc_response = f'+QIOPEN: {connect_id},0\r\n'
-                return {"delay": 1.0, "response": urc_response + "OK"}
-            else:
+            params = re.findall(r'"[^"]*"|[^,]+', cmd.split("=", 1)[1])
+            params = [p.strip().strip('"') for p in params if p.strip()]
+            if len(params) < 5:
+                print("QIOPEN ERROR: málo parametrů", params)
                 return {"now": "ERROR"}
-        except:
+
+            context_id = int(params[0])
+            connect_id = int(params[1])
+            service_type = params[2].upper()
+            ip_address = params[3]
+            remote_port = int(params[4])
+            local_port = int(params[5]) if len(params) > 5 else 0
+            access_mode = int(params[6]) if len(params) > 6 else 0
+
+            if "sockets" not in global_state:
+                global_state["sockets"] = {}
+
+            if connect_id in global_state["sockets"]:
+                print(f"QIOPEN ERROR: connect_id {connect_id} už existuje")
+                return {"now": "ERROR"}
+
+            # Uložení socketu do global_state
+            global_state["sockets"][connect_id] = {
+                "context_id": context_id,
+                "service_type": service_type,
+                "ip_address": ip_address,
+                "remote_port": remote_port,
+                "local_port": local_port,
+                "access_mode": access_mode,
+                "status": "connecting",
+                "recv_buffer": b""
+            }
+
+            print(f"[QIOPEN] Opening socket: connect={connect_id}, type={service_type}, ip={ip_address}:{remote_port}")
+
+            # SPUSTIT PARALELNÍ VLÁKNO PRO SOCKET (HNED, BEZ ČEKÁNÍ)
+            socket_thread = threading.Thread(
+                target=manage_socket,
+                args=(connect_id, ip_address, remote_port, service_type),
+                daemon=True
+            )
+            socket_thread.start()
+
+            # Odpověď
+            if access_mode == 2:
+                return {"delay": 0.0, "response": "CONNECT"}
+            else:
+                urc_response = f'+QIOPEN: {connect_id},0'
+                return {"delay": 0.0, "response": urc_response}
+
+        except Exception as e:
+            print(f"QIOPEN ERROR: {e}")
+            import traceback
+            traceback.print_exc()
             return {"now": "ERROR"}
 
     # ---------------------------------------------------------
@@ -547,22 +645,31 @@ def evaluate_at_command(cmd):
     # ---------------------------------------------------------
     if cmd.startswith("AT+QISEND="):
         try:
-            # Parsování parametrů: AT+QISEND=<connectID>,<send_length>
             params = cmd.split("=")[1].split(",")
             if len(params) >= 2:
                 connect_id = int(params[0])
                 send_length = int(params[1])
-                
-                # Kontrola, zda socket existuje a je připojen
-                if connect_id not in global_state["sockets"] or global_state["sockets"][connect_id]["status"] != "connected":
+
+                # Kontrola, zda socket existuje
+                if connect_id not in global_state["sockets"]:
+                    print(f"[QISEND] ERROR: connect_id {connect_id} not found")
                     return {"now": "ERROR"}
-                
-                # V emulátoru jednoduše potvrdíme přijetí příkazu
-                # V reálném modemu by zde čekal na data k odeslání
+
+                socket_info = global_state["sockets"][connect_id]
+
+                # Pokud socket není connected, vrať ERROR
+                if socket_info["status"] not in ("connected", "connecting"):
+                    print(f"[QISEND] ERROR: socket {connect_id} status is {socket_info['status']}")
+                    return {"now": "ERROR"}
+
+                print(f"[QISEND] Ready for {send_length} bytes on socket {connect_id}")
+
+                # Vrátit prompt '>' - klient pak pošle data
                 return {"delay": 0.1, "response": ">"}
             else:
                 return {"now": "ERROR"}
-        except:
+        except Exception as e:
+            print(f"[QISEND] Exception: {e}")
             return {"now": "ERROR"}
 
     # ---------------------------------------------------------
@@ -570,13 +677,13 @@ def evaluate_at_command(cmd):
     # ---------------------------------------------------------
     if cmd.startswith("AT+QICLOSE="):
         try:
-            # Parsování parametrů: AT+QICLOSE=<connectID>
             connect_id = int(cmd.split("=")[1])
-            
+
             # Kontrola, zda socket existuje
             if connect_id not in global_state["sockets"]:
+                print(f"[QICLOSE] ERROR: connect_id {connect_id} not found")
                 return {"now": "ERROR"}
-            
+
             # Uzavření socketu
             try:
                 if "socket" in global_state["sockets"][connect_id]:
@@ -586,14 +693,14 @@ def evaluate_at_command(cmd):
 
             with mutex:
                 del global_state["sockets"][connect_id]
-            # Aktualizace stavu
-           # global_state["sockets"][connect_id]["status"] = "closed"
-            
-            print(f"[QICLOSE] Closed socket {connect_id}")
-            
+
+            print(f"[QICLOSE] Socket {connect_id} closed and removed")
+
             return {"delay": 0.2, "response": "OK"}
-        except:
+        except Exception as e:
+            print(f"[QICLOSE] Exception: {e}")
             return {"now": "ERROR"}
+
         # ---------------------------------------------------------
         # AT+QIRD  (čtení dat ze socketu)
         # ---------------------------------------------------------
@@ -614,29 +721,18 @@ def evaluate_at_command(cmd):
             if socket_info.get("status") != "connected":
                 return {"now": "ERROR"}
 
-            # Čtení dat z bufferu
             with mutex:
                 recv_buffer = socket_info.get("recv_buffer", b"")
-
-                # Převezmi maximálně request_length bytů
                 data_to_read = recv_buffer[:request_length]
+                socket_info["recv_buffer"] = recv_buffer[request_length:]
 
-                # Aktualizuj buffer
-                remaining_data = recv_buffer[request_length:]
-                socket_info["recv_buffer"] = remaining_data
-
-            # Vrátit data nebo "OK" pokud žádná nejsou
             if not data_to_read:
                 return {"now": "+QIRD: 0\r\n\r\nOK"}
 
-             # Převod dat na string (UTF-8 s fallbackem na ignore)
             data_str = data_to_read.decode(errors='ignore')
-
-            # Odpověď: +QIRD: <délka_dat>
-            #          <data>
-            #          OK
             resp = f'+QIRD: {len(data_to_read)}\r\n{data_str}\r\n\r\nOK'
             return {"now": resp}
+
 
         except Exception as e:
             print(f"[QIRD] Error: {e}")
@@ -673,6 +769,10 @@ def at_thread():
                 print("[AT] Received:", cmd)
 
                 response = evaluate_at_command(cmd)
+
+                # -----------------------------
+                # Funkce ping pro postupné vypsání odpovědí a formát jako v BG77
+                # -----------------------------
 
                 result = evaluate_at_command(cmd)
 
@@ -812,6 +912,8 @@ if __name__ == "__main__":
     threading.Thread(target=timer_thread, daemon=True).start()
     threading.Thread(target=at_thread, daemon=True).start()
     threading.Thread(target=settings_thread, daemon=True).start()
+    threading.Thread(target=socket_worker, daemon=True).start()  # ← PŘIDEJ TOTO
 
     while True:
         time.sleep(1)
+
