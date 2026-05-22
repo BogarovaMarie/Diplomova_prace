@@ -12,6 +12,7 @@ import queue
 # KONSTANTY
 # -----------------------------
 AT_PORT = 50000
+QI_PORT = 50001  # ← NOVÝ PORT PRO QI PŘÍKAZY
 SETTINGS_PORT = 65000
 
 # -----------------------------
@@ -580,6 +581,118 @@ def evaluate_at_command(cmd):
             return {"now": "ERROR"}
 
     # ---------------------------------------------------------
+    # AT+QISTATE  (Query Socket Service Status)
+    # ---------------------------------------------------------
+
+    # AT+QISTATE=?
+    if cmd == "AT+QISTATE=?":
+        return {"now": "OK"}
+
+    # AT+QISTATE? nebo AT+QISTATE (Query all sockets)
+    if cmd in ("AT+QISTATE?", "AT+QISTATE"):
+        resp = ""
+        for connect_id, socket_info in global_state["sockets"].items():
+            # Mapování stavu socketu
+            # 0 = Initial, 1 = Opening, 2 = Connected, 3 = Listening, 4 = Closing
+            status_map = {
+                "connecting": 1,  # Opening
+                "connected": 2,  # Connected
+                "listening": 3,  # Listening
+                "closing": 4,  # Closing
+                "failed": 0  # Initial (error state)
+            }
+            socket_state = status_map.get(socket_info.get("status", "connecting"), 0)
+
+            service_type = socket_info.get("service_type", "TCP")
+            ip_address = socket_info.get("ip_address", "127.0.0.1")
+            remote_port = socket_info.get("remote_port", 0)
+            local_port = socket_info.get("local_port", 0)
+            context_id = socket_info.get("context_id", 1)
+            access_mode = socket_info.get("access_mode", 0)
+
+            # serverID je platné pouze pro TCP INCOMING - zatím je None (nezpracováváme)
+            server_id = 0
+
+            # AT_port: "usbmodem" nebo "uart1"
+            at_port = "usbmodem"
+
+            resp += f'+QISTATE: {connect_id},"{service_type}","{ip_address}",{remote_port},{local_port},{socket_state},{context_id},{server_id},{access_mode},"{at_port}"\r\n'
+
+        resp += "OK"
+        return {"now": resp}
+
+    # AT+QISTATE=0,<contextID> (Query all sockets in a specific context)
+    if cmd.startswith("AT+QISTATE=0,"):
+        try:
+            context_id = int(cmd.split("=")[1].split(",")[1])
+            resp = ""
+
+            for connect_id, socket_info in global_state["sockets"].items():
+                # Filtruj jen sockety s daným context_id
+                if socket_info.get("context_id") != context_id:
+                    continue
+
+                status_map = {
+                    "connecting": 1,
+                    "connected": 2,
+                    "listening": 3,
+                    "closing": 4,
+                    "failed": 0
+                }
+                socket_state = status_map.get(socket_info.get("status", "connecting"), 0)
+
+                service_type = socket_info.get("service_type", "TCP")
+                ip_address = socket_info.get("ip_address", "127.0.0.1")
+                remote_port = socket_info.get("remote_port", 0)
+                local_port = socket_info.get("local_port", 0)
+                access_mode = socket_info.get("access_mode", 0)
+                server_id = 0
+                at_port = "usbmodem"
+
+                resp += f'+QISTATE: {connect_id},"{service_type}","{ip_address}",{remote_port},{local_port},{socket_state},{context_id},{server_id},{access_mode},"{at_port}"\r\n'
+
+            resp += "OK"
+            return {"now": resp}
+        except Exception as e:
+            print(f"[QISTATE] Error in query_type=0: {e}")
+            return {"now": "ERROR"}
+
+    # AT+QISTATE=1,<connectID> (Query specific socket)
+    if cmd.startswith("AT+QISTATE=1,"):
+        try:
+            connect_id = int(cmd.split("=")[1].split(",")[1])
+
+            # Kontrola, zda socket existuje
+            if connect_id not in global_state["sockets"]:
+                return {"now": "ERROR"}
+
+            socket_info = global_state["sockets"][connect_id]
+
+            status_map = {
+                "connecting": 1,
+                "connected": 2,
+                "listening": 3,
+                "closing": 4,
+                "failed": 0
+            }
+            socket_state = status_map.get(socket_info.get("status", "connecting"), 0)
+
+            service_type = socket_info.get("service_type", "TCP")
+            ip_address = socket_info.get("ip_address", "127.0.0.1")
+            remote_port = socket_info.get("remote_port", 0)
+            local_port = socket_info.get("local_port", 0)
+            context_id = socket_info.get("context_id", 1)
+            access_mode = socket_info.get("access_mode", 0)
+            server_id = 0
+            at_port = "usbmodem"
+
+            resp = f'+QISTATE: {connect_id},"{service_type}","{ip_address}",{remote_port},{local_port},{socket_state},{context_id},{server_id},{access_mode},"{at_port}"\r\nOK'
+            return {"now": resp}
+        except Exception as e:
+            print(f"[QISTATE] Error in query_type=1: {e}")
+            return {"now": "ERROR"}
+
+    # ---------------------------------------------------------
     # AT+QIOPEN  (otevření socketu)
     # ---------------------------------------------------------
     if cmd.startswith("AT+QIOPEN="):
@@ -912,7 +1025,7 @@ if __name__ == "__main__":
     threading.Thread(target=timer_thread, daemon=True).start()
     threading.Thread(target=at_thread, daemon=True).start()
     threading.Thread(target=settings_thread, daemon=True).start()
-    threading.Thread(target=socket_worker, daemon=True).start()  # ← PŘIDEJ TOTO
+    threading.Thread(target=socket_worker, daemon=True).start()
 
     while True:
         time.sleep(1)
