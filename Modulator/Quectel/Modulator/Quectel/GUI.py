@@ -184,24 +184,16 @@ def main():
 
     tk.Button(ram, text="AT+QCSQ", command=lambda: pridat_prikaz("AT+QCSQ")).place(x=750, y=50, anchor=tk.N)
 
-    # rozdíl opproti QCSQ? AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
-
     # ještě není AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
-    # tam je AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
-    # tam je AT+QCSQ  Query and Report Signal Strength RSRP
 
     # je, ale nefunguje možná vynechat?  AT + QCFG = "band" Band Configuration
-    # je AT + QNWINFO Query Network Information
     # ještě není AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
     # NB-IoT moc nevím, co to vlastně dělá, asi jen něco vrací podle návodu
     # ještě není AT + QCFG = "nccconf" Configure NB - IoT Features
 
-    # je AT + COPS Operator Selection
-    # AT+CEREG 4 pokud je v PSM módu, mám implementovat i všechny tři PSM módy?
+    # AT+CEREG 4 pokud je v PSM módu, mám implementovat i všechny tři PSM módy asi stačí jeden viz foto
     # ještě není AT + CEDRXS e - I - DRX Setting
     # ještě není AT + CEDRXRDP Read Dynamic Parameters
-
-    # ještě není ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
 
     # Spustí smyčku Thinker
     root.mainloop()

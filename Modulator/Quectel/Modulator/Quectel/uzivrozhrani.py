@@ -14,6 +14,7 @@ AT_PORT = 50000
 SET_IP = "127.0.0.1"
 SET_PORT = 65000
 
+QI_PORT = 50001  # ← NOVÝ
 
 # ---------------------------------------------------------
 # ODESLÁNÍ NASTAVENÍ (RSRP + BAND)
@@ -41,7 +42,7 @@ def at_worker():
         cmd, callback = at_queue.get()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((AT_IP, AT_PORT))
+            sock.connect((AT_IP, QI_PORT))
             sock.sendall((cmd + "\n").encode())
             sock.settimeout(2)
 
@@ -232,7 +233,7 @@ def main():
         send_at_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
     def odeslat_cmd_special(cmd):
-        log(f"> {cmd}")  # HNED se zobrazí příkaz
+        log(cmd)  # HNED se zobrazí příkaz
         send_qiopen_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
     tk.Button(ram, text="AT", command=lambda: odeslat_cmd("AT")).place(x=200, y=80, anchor=tk.N)
@@ -253,7 +254,7 @@ def main():
     tk.Button(ram, text="AT+CGMI", command=lambda: odeslat_cmd("AT+CGMI")).place(x=420, y=140, anchor=tk.N)
 
     # Čtvrtá řada tlačítek - SPECIÁLNÍ PŘÍKAZY S FRONTOU
-    tk.Button(ram, text="AT+QIOPEN", command=lambda: odeslat_cmd_special('AT+QIOPEN=1,0,"TCP","127.0.0.1",8080')).place(
+    tk.Button(ram, text="AT+QIOPEN", command=lambda: odeslat_cmd_special('AT+QIOPEN=2,2,"TCP","62.245.74.185",7010')).place(
         x=200, y=170, anchor=tk.N)
 
     root.mainloop()

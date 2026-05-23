@@ -777,8 +777,15 @@ def evaluate_at_command(cmd):
 
                 print(f"[QISEND] Ready for {send_length} bytes on socket {connect_id}")
 
-                # Vrátit prompt '>' - klient pak pošle data
-                return {"delay": 0.1, "response": ">"}
+                # Vrátit prompt '>' a signalizovat čekání na data
+                return {
+                    "delay": 0.1,
+                    "response": ">",
+                    "wait_for_data": True,
+                    "connect_id": connect_id,
+                    "send_length": send_length,
+                    "access_mode": socket_info.get("access_mode", 0)
+                }
             else:
                 return {"now": "ERROR"}
         except Exception as e:
@@ -859,9 +866,9 @@ def evaluate_at_command(cmd):
 
 ## Odesílá přes socket s jiným portem než settings (AT_PORT, AT_SETTINGS_PORT)
 #musí se to předávat JSONem? tady se to předává bez toho...
-# -----------------------------
-# VLÁKNO 1 – AT SOCKET
-# -----------------------------
+# ---------------------------------------------------------
+# VLÁKNO 1 – AT SOCKET (BĚžNÉ PŘÍKAZY POUZE)
+# ---------------------------------------------------------
 def at_thread():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", AT_PORT))
@@ -881,16 +888,15 @@ def at_thread():
                 cmd = data.decode().strip()
                 print("[AT] Received:", cmd)
 
-                response = evaluate_at_command(cmd)
-
-                # -----------------------------
-                # Funkce ping pro postupné vypsání odpovědí a formát jako v BG77
-                # -----------------------------
+                # Přesměruj AT+QI* na speciální vlákno
+                if cmd.startswith("AT+QI"):
+                    conn.sendall(b"REDIRECTED_TO_QI_PORT\r\n")
+                    continue
 
                 result = evaluate_at_command(cmd)
 
+                # Ping handling
                 if "ping_sequence" in result:
-                    # HNED poslat OK
                     conn.sendall(b"OK\r\n\r\n")
 
                     params = result["ping_sequence"]
@@ -903,7 +909,7 @@ def at_thread():
                     sent = ping_num
                     rcvd = 0
                     lost = 0
-                    delay_step = 0.15  # zpoždění mezi odpověďmi v sekundách
+                    delay_step = 0.15
 
                     for i in range(ping_num):
                         reply_time, ttl = get_ping_response(ip_address, timeout)
@@ -917,7 +923,6 @@ def at_thread():
                             resp = f'+QPING: 0,"{ip_address}",32,{timeout},0'
                         schedule_response(conn, resp, delay=(i + 1) * delay_step)
 
-                    # Statistika po posledním pingu
                     if times:
                         min_time = min(times)
                         max_time = max(times)
@@ -927,7 +932,7 @@ def at_thread():
 
                     stat_resp = f'+QPING: 0,{sent},{rcvd},{lost},{min_time},{max_time},{avg_time}'
                     schedule_response(conn, stat_resp, delay=(ping_num + 1) * delay_step)
-                    continue  # přeskočte další zpracování, už jste naplánovali odpovědi
+                    continue
 
                 with mutex:
                     if "now" in result:
@@ -935,13 +940,92 @@ def at_thread():
                     elif "delay" in result:
                         schedule_response(conn, result["response"], result["delay"])
 
-            except:
+            except Exception as e:
+                print(f"[AT] Exception: {e}")
                 break
 
         conn.close()
         print("[AT] Client disconnected")
 
-#Nějaké další parametry?
+
+# ---------------------------------------------------------
+# VLÁKNO 1B – QI SOCKET (AT+QI* PŘÍKAZY)
+# ---------------------------------------------------------
+def qi_thread():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", QI_PORT))
+    server.listen(1)
+    print(f"[QI] Listening on port {QI_PORT}")
+
+    while True:
+        conn, addr = server.accept()
+        print("[QI] Client connected:", addr)
+
+        # Sledování stavu: čekáme na data pro QISEND?
+        send_wait_state = None  # {"connect_id": X, "send_length": Y, "access_mode": Z}
+
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    break
+
+                # Pokud čekáme na data z QISEND, zpracuj je
+                if send_wait_state is not None:
+                    connect_id = send_wait_state["connect_id"]
+                    send_data = data.decode(errors='ignore').strip()
+
+                    print(f"[QI] Received QISEND data on socket {connect_id}: {send_data}")
+
+                    if connect_id in global_state["sockets"]:
+                        socket_info = global_state["sockets"][connect_id]
+                        access_mode = socket_info.get("access_mode", 0)
+
+                        # Uložení dat do bufferu
+                        with mutex:
+                            socket_info["recv_buffer"] += send_data.encode()
+
+                        # Odpověď podle access_mode
+                        if access_mode == 0:
+                            resp = f"SEND OK\r\n+QIURC: \"recv\",{connect_id}\r\n"
+                        else:
+                            resp = f"SEND OK\r\n"
+
+                        conn.sendall(resp.encode())
+                        send_wait_state = None
+                    else:
+                        conn.sendall(b"ERROR\r\n")
+                        send_wait_state = None
+
+                    continue
+
+                # Běžný QI příkaz
+                cmd = data.decode().strip()
+                print("[QI] Received:", cmd)
+
+                result = evaluate_at_command(cmd)
+
+                # Kontrola, jestli QISEND čeká na data
+                if "wait_for_data" in result and result["wait_for_data"]:
+                    send_wait_state = {
+                        "connect_id": result["connect_id"],
+                        "send_length": result["send_length"],
+                        "access_mode": result.get("access_mode", 0)
+                    }
+
+                with mutex:
+                    if "now" in result:
+                        conn.sendall((result["now"] + "\r\n").encode())
+                    elif "delay" in result:
+                        schedule_response(conn, result["response"], result["delay"])
+
+            except Exception as e:
+                print(f"[QI] Exception: {e}")
+                break
+
+        conn.close()
+        print("[QI] Client disconnected")
+
 # -----------------------------
 # VLÁKNO 2 – SETTINGS SOCKET
 # -----------------------------
@@ -1026,6 +1110,7 @@ if __name__ == "__main__":
     threading.Thread(target=at_thread, daemon=True).start()
     threading.Thread(target=settings_thread, daemon=True).start()
     threading.Thread(target=socket_worker, daemon=True).start()
+    threading.Thread(target=qi_thread, daemon=True).start()
 
     while True:
         time.sleep(1)
