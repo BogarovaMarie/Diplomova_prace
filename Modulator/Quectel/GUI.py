@@ -1,215 +1,288 @@
 import tkinter as tk
-from tkinter import messagebox
-from tkinter import ttk
-from tkinter import*
+from tkinter import messagebox, ttk
 import socket
 import json
-import Backend_Quectel_Server
+import threading
+import queue
+#import pillow
 
-REMOTE_IP = "127.0.0.1"
-REMOTE_PORT = 65000
+# pro fungování obrázků v Tkinteru je potřeba nainstalovat Pillow: pip install Pillow
+from PIL import Image, ImageTk
 
-#---------------------------------------------------------
- #SOCKET KLIENT
- #---------------------------------------------------------
-def odesli_socket():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((REMOTE_IP, REMOTE_PORT))
-    print("Server běží na 127.0.0.1:65000 (non-blocking)")
-    sock.close()
+AT_IP = "127.0.0.1"
+AT_PORT = 50000
 
-#pouze okno pro zobrazeni akce, varování atd.
-def kliknuti_na_tlacitko():
-    """Zobrazovač událostí na kliknutí. Nastavení"""
-    messagebox.showinfo("Nastavení", "Síla signálu (RSRP)")
-    # Vytvoření popisku
-  #  sila_signalu = tk.Label(okno, text="Síla signálu (RSRP)\n", font=("Arial", 12))
-   # sila_signalu.pack(pady=20, side=LEFT)
-    # Vytvoření popisku
-    #bunka_identifikator = tk.Label(okno, text="\nIdentifikátor buňky", font=("Arial", 12))
-    #bunka_identifikator.pack(pady=20, side=LEFT)
+SET_IP = "127.0.0.1"
+SET_PORT = 65000
 
+# ---------------------------------------------------------
+# ODESLÁNÍ NASTAVENÍ (RSRP + BAND)
+# ---------------------------------------------------------
+def send_settings(rsrp_value, rssi_value, sinr_value, ber_value, band_value):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((SET_IP, SET_PORT))
+        data = {"RSRP": rsrp_value, "RSSI": rssi_value, "SINR": sinr_value, "BER": ber_value, "band": band_value}
+        sock.sendall(json.dumps(data).encode())
+        sock.close()
+    except Exception as e:
+        messagebox.showerror("Chyba", f"Nepodařilo se odeslat nastavení:\n{e}")
+
+
+# ---------------------------------------------------------
+# FRONTA PRO BĚŽNÉ AT PŘÍKAZY (ASYNCHRONNÍ)
+# ---------------------------------------------------------
+at_queue = queue.Queue()
+
+
+def at_worker():
+    """Vlákno pro asynchronní zpracování běžných AT příkazů"""
+    while True:
+        cmd, callback = at_queue.get()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((AT_IP, AT_PORT))
+            sock.sendall((cmd + "\n").encode())
+            sock.settimeout(2)
+
+            chunks = []
+            while True:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data.decode(errors="ignore"))
+                except socket.timeout:
+                    break
+
+            sock.close()
+
+            if not chunks:
+                callback("(žádná odpověď)")
+            else:
+                callback("".join(chunks).strip())
+
+        except Exception as e:
+            callback(f"CHYBA spojení s emulátorem: {e}")
+        at_queue.task_done()
+
+
+# Spustit vlákno pro běžné příkazy
+threading.Thread(target=at_worker, daemon=True).start()
+
+def send_at_command(cmd, callback):
+    """Asynchronní odeslání běžného AT příkazu"""
+    at_queue.put((cmd, callback))
+
+
+
+def send_qiopen_command(cmd, callback):
+    """Vloží speciální příkaz do fronty (QIOPEN, QICLOSE, QISEND, QIRD)"""
+    qiopen_queue.put((cmd, callback))
+
+qiopen_queue = queue.Queue()
+
+def qiopen_worker():
+    while True:
+        cmd, callback = qiopen_queue.get()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((AT_IP, AT_PORT))
+            sock.sendall((cmd + "\n").encode())
+            sock.settimeout(15)
+            chunks = []
+            while True:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data.decode(errors="ignore"))
+                except socket.timeout:
+                    break
+            if not chunks:
+                callback("(žádná odpověď)")
+            else:
+                callback("".join(chunks).strip())
+        except Exception as e:
+            callback(f"CHYBA spojení s emulátorem: {e}")
+        qiopen_queue.task_done()
+
+threading.Thread(target=qiopen_worker, daemon=True).start()
+
+# ---------------------------------------------------------
+# GUI
+# ---------------------------------------------------------
 def main():
-    # Vytvoří hlavní okno aplikace
     root = tk.Tk()
-    root.title("Emulátor modemu Quectel BG77")
-    root.geometry("1000x600")  # Šířka x Výška
+    root.title("Emulátor modemu Quectel BG77 – GUI")
+    root.geometry("1000x600")
 
-    # Rám pro lepší uspořádání
     ram = ttk.Frame(root)
     ram.pack(fill="both", expand=True)
 
     # ---------------------------------------------------------
     # OKNO NASTAVENÍ
     # ---------------------------------------------------------
-
     def otevrit_nastaveni():
-        """Otevře nové okno s nastavením."""
-        # Pokud už okno existuje, neotevírat znovu
         if hasattr(otevrit_nastaveni, "okno") and otevrit_nastaveni.okno.winfo_exists():
-            otevrit_nastaveni.okno.lift()  # Přenést dopředu
+            otevrit_nastaveni.okno.lift()
             return
 
-        # Vytvoření nového okna
         nastaveni = tk.Toplevel(root)
         nastaveni.title("Nastavení")
-        nastaveni.geometry("600x400")
+        nastaveni.geometry("800x600")
         nastaveni.resizable(False, False)
-
-        # Uložíme referenci, aby se neotevíralo vícekrát
         otevrit_nastaveni.okno = nastaveni
 
-        # Label + Scale
-        tk.Label(nastaveni, text="Síla signálu RSRP:", font=("Arial", 10)).pack(pady=5)
-        RSRP = tk.Scale(nastaveni, from_=-60, to=-140, orient="horizontal")
-        RSRP.pack(pady=5)
+        tk.Label(nastaveni, text="Síla signálu RSRP:", font=("Arial", 10)).place(x=150, y=60)
+        RSRP = tk.Scale(nastaveni, from_=-140, to=-60, orient="horizontal")
+        RSRP.set(-100)
+        RSRP.place(x=150, y=80)
 
-        # Label + Textové pole
-        tk.Label(nastaveni, text="Pásmo může nabývat hodnot pro GSM 900, 1800, 850 a 1900 MHz. Pro eMTC i NB-iOT \n je B1-5,B8, B12-B14, B18-B20, B25-B28, B31, B66, B72-73, B85.\n V NB-IoT není B14, B27 a navíc je tam B71.", font=("Arial", 10)).pack(pady=5)
+        tk.Label(nastaveni, text="RSSI:", font=("Arial", 10)).place(x=150, y=130)
+        RSSI = tk.Scale(nastaveni, from_=-90, to=-60, orient="horizontal")
+        RSSI.set(-80)
+        RSSI.place(x=150, y=150)
 
-        # Label + Textové pole
-        tk.Label(nastaveni, text="Číslo pásma", font=("Arial", 10)).pack(pady=5)
-        cislo_pasma = tk.Entry(nastaveni, width=30)
-        cislo_pasma.pack(pady=5)
+        tk.Label(nastaveni, text="SINR:", font=("Arial", 10)).place(x=150, y=210)
+        SINR = tk.Scale(nastaveni, from_=0, to=250, orient="horizontal")
+        SINR.set(100)
+        SINR.place(x=150, y=230)
+
+        tk.Label(nastaveni, text="BER:", font=("Arial", 10)).place(x=150, y=290)
+        BER = tk.Scale(nastaveni, from_=0, to=100, orient="horizontal")
+        BER.set(100)
+        BER.place(x=150, y=310)
+
+        tk.Label(nastaveni, text="Číslo pásma (např. band 20):", font=("Arial", 10)).place(x=150, y=370)
+        tk.Label(nastaveni,
+                 text="Pásmo může nabývat hodnot pro GSM 900, 1800, 850 a 1900 MHz.\n Pro eMTC i NB-iOT je B1-5,B8, B12-B14, B18-B20, B25-B28, B31, B66,\n B72-73, B85. V NB-IoT není B14, B27 a navíc je tam B71.",
+                 font=("Arial", 10)).place(x=60, y=390)
+
+        cislo_pasma = tk.Entry(nastaveni, width=20)
+        cislo_pasma.insert(0, "band 20")
+        cislo_pasma.place(x=150, y=445)
+
+        # ---- OBRÁZEK DESKY ----
+        # Načtení a zmenšení obrázku
+        img = Image.open("antena.jpg")  # Změňte na název vašeho souboru
+        img = img.resize((200, 400))  # Přizpůsobte velikost dle potřeby
+        img_tk = ImageTk.PhotoImage(img)
+
+        # Vytvoření labelu s obrázkem
+        obrazek_label = tk.Label(nastaveni, image=img_tk)
+        obrazek_label.image = img_tk  # Udržet referenci!
+        obrazek_label.place(x=540, y=60)  # Umístění vpravo nahoře pod lištu a nad odpovědi
 
         def ulozit():
             rsrp_value = RSRP.get()
-            band_value = cislo_pasma.get()
+            rssi_value = RSSI.get()
+            sinr_value = SINR.get()
+            ber_value = BER.get()
+            band_value = cislo_pasma.get().strip()
 
-            Backend_Quectel_Server.uloz_nastaveni(rsrp_value, band_value)
+            if not band_value:
+                messagebox.showwarning("Chyba", "Zadej číslo pásma (např. band 20).")
+                return
 
-            # ODESLÁNÍ DO DRUHÉ APLIKACE
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect(("127.0.0.1", 65000))  # MUSÍ odpovídat serveru
-                data = {"rsrp": rsrp_value, "band": band_value}
-                sock.sendall(json.dumps(data).encode())
-                sock.close()
-            except Exception as e:
-                print("Chyba socketu:", e)
+            send_settings(rsrp_value, rssi_value, sinr_value, ber_value, band_value)
 
-            messagebox.showinfo("Info", "Nastavení uloženo a odesláno.")
-            # uložíme hodnoty do instance Backend_Quectel_Server
-            Backend_Quectel_Server.uloz_nastaveni(rsrp_value, band_value)
             messagebox.showinfo(
                 "Info",
-                f"Nastavení uloženo\nRSRP: {Backend_Quectel_Server.rsrp}\nČíslo pásma: {Backend_Quectel_Server.band}"
-
+                f"Nastavení odesláno do emulátoru.\r\n RSRP: {rsrp_value}\r\n RSSI: {rssi_value} \r\n SINR: {sinr_value} \r\n BER: {ber_value} \r\n Pásmo: {band_value}"
             )
 
-        tk.Button(nastaveni, text="Uložit", command=ulozit).pack(pady=5)
-        tk.Button(nastaveni, text="Zavřít", command=nastaveni.destroy).pack(pady=5)
+            nastaveni.destroy()
 
+        tk.Button(nastaveni, text="Uložit", command=ulozit).place(x=400, y=500)
+        tk.Button(nastaveni, text="Zavřít", command=nastaveni.destroy).place(x=400, y=550)
 
-    # Create a button
-    tlacitko_nastaveni = tk.Button(root, text="Nastavení", command=otevrit_nastaveni)
-    tlacitko_nastaveni.place(x=50, y=20, anchor=tk.N)
+    # Tlačítko Nastavení
+    tk.Button(root, text="Nastavení", command=otevrit_nastaveni).place(x=50, y=20, anchor=tk.N)
 
-    # Vytvoření popisku
-    odpoved_tisk = tk.Label(root, text="Vlož prosím text k odeslání")
-    odpoved_tisk.place(x=120, y=50, anchor=tk.N)
-
-    # Textové pole
+    # ---------------------------------------------------------
+    # AT PŘÍKAZY
+    # ---------------------------------------------------------
+    tk.Label(root, text="Vlož prosím AT příkaz:", font=("Arial", 10)).place(x=200, y=50, anchor=tk.N)
     vstup = tk.Entry(root, width=40)
-    vstup.place(x=350, y=55, anchor=tk.N)
+    vstup.place(x=450, y=55, anchor=tk.N)
 
-    def pridat_zpravu():
-        """Přidá text z horního pole do spodního rámečku."""
-        text = vstup.get().strip()  # vezme text a odstraní mezery na začátku/konci
-        if not text:
-            messagebox.showwarning("Prázdný vstup", "Zadejte prosím nějaký text.")
-            return
+    # Výstupní okno
+    ramecek = tk.LabelFrame(root, text="Odeslané příkazy a odpovědi", padx=5, pady=5)
+    ramecek.pack(fill="both", expand=True, padx=20, pady=80)
 
-        # Přidání textu do spodního textového pole
-        vystup.config(state="normal")  # povolit úpravy
-        vystup.insert(tk.END, text + "\n")  # přidat na konec
-        response = Backend_Quectel_Server.get_odpoved(text)
-        vystup.insert(tk.END, response + "\n")
-        vystup.config(state="disabled")  # znovu zamknout
-        vstup.delete(0, tk.END)  # vymazat horní pole
-
-    # Vytvoření tlačítka
-    tlacitko = tk.Button(root, text="Odeslat", command=pridat_zpravu)
-    tlacitko.place(x=500, y=50, anchor=tk.N)
-
-    # Rámeček pro spodní textové pole
-    ramecek = tk.LabelFrame(root, text="Odeslané příkazy", padx=5, pady=5)
-    ramecek.pack(fill="both", expand=True, padx=20, pady=20)
-
-    # Spodní textové pole (jen pro čtení)
     vystup = tk.Text(ramecek, wrap="word", height=10, state="disabled", font=("Arial", 10))
     vystup.pack(fill="both", expand=True)
 
-    # ---------------------------------------------------------
-    # FUNKCE PRO ODESÍLÁNÍ PŘÍKAZŮ
-    # ---------------------------------------------------------
-    # Univerzální funkce
-    def pridat_prikaz(cmd):
+    def log(text):
         vystup.config(state="normal")
-        vystup.insert(tk.END, cmd + "\n")
-
-        response = Backend_Quectel_Server.get_odpoved(cmd)
-        vystup.insert(tk.END, response + "\n")
-
+        vystup.insert(tk.END, text + "\r\n")
+        vystup.see(tk.END)
         vystup.config(state="disabled")
+
+    def odeslat_vstup():
+        cmd = vstup.get().strip()
+        if not cmd:
+            messagebox.showwarning("Chyba", "Zadej AT příkaz.")
+            return
+
+        log(f"{cmd}")  # HNED se zobrazí příkaz
         vstup.delete(0, tk.END)
 
-#obsahuje cell iD
-    tk.Button(ram, text="AT+CEREG?", command=lambda: pridat_prikaz("AT+CEREG?")).place(x=900, y=50, anchor=tk.N)
+        # Rozlišení mezi běžným a speciálním příkazem
+        if cmd.startswith("AT+QI"):  # QIOPEN, QICLOSE, QISEND, QIRD
+            send_qiopen_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
+        else:
+            send_at_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
-    #   AT + CGREG EGPRS Network Registration Status, AT + CREG existuje i toto
-    # Funkce, která se spustí po kliknutí na tlačítko
-    def pridat_AT():
-        vystup.config(state="normal")  # povolit úpravy
-        vystup.insert(tk.END, "AT" + "\n")  # přidat na konec
-        response = Backend_Quectel_Server.get_odpoved("AT")
-        vystup.insert(tk.END, response + "\n")
-        vystup.config(state="disabled")  # znovu zamknout
-        vstup.delete(0, tk.END)  # vymazat horní pole
+    vstup.bind("<Return>", lambda event: odeslat_vstup())
 
-    tlacitko2 = Button(ram, text="AT", command=pridat_AT)
-    tlacitko2.place(x=700, y=50, anchor=tk.N)
+    tk.Button(root, text="Odeslat", command=odeslat_vstup).place(x=700, y=50, anchor=tk.N)
 
-    def pridat_ATE():
-        vystup.config(state="normal")  # povolit úpravy
-        vystup.insert(tk.END, "ATE" + "\n")  # přidat na konec
-        response = Backend_Quectel_Server.get_odpoved("ATE")
-        vystup.insert(tk.END, response + "\n")
-        vystup.config(state="disabled")  # znovu zamknout
-        vstup.delete(0, tk.END)  # vymazat horní pole
+    # Předdefinovaná tlačítka
+    def odeslat_cmd(cmd):
+        log(cmd)  # HNED se zobrazí příkaz
+        send_at_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
-#echo
-    tlacitko3 = Button(ram, text="ATE", command=pridat_ATE)
-    tlacitko3.place(x=800, y=50, anchor=tk.N)
+    def odeslat_cmd_special(cmd):
+        log(cmd)  # HNED se zobrazí příkaz
+        send_qiopen_command(cmd, lambda resp: log(resp))  # Se zpožděním přijde odpověď
 
-    tk.Button(ram, text="AT+QCSQ", command=lambda: pridat_prikaz("AT+QCSQ")).place(x=750, y=50, anchor=tk.N)
+    tk.Button(ram, text="AT", command=lambda: odeslat_cmd("AT")).place(x=200, y=80, anchor=tk.N)
+    tk.Button(ram, text="ATE", command=lambda: odeslat_cmd("ATE")).place(x=250, y=80, anchor=tk.N)
+    tk.Button(ram, text="AT+QCSQ", command=lambda: odeslat_cmd("AT+QCSQ")).place(x=320, y=80, anchor=tk.N)
+    tk.Button(ram, text="AT+CEREG?", command=lambda: odeslat_cmd("AT+CEREG?")).place(x=420, y=80, anchor=tk.N)
 
-    # rozdíl opproti QCSQ? AT+CSQ  Signal Quality Report AT+CSQ  RSSI Signal strength a BER
+    # Další řada tlačítek
+    tk.Button(ram, text="AT+CFUN?", command=lambda: odeslat_cmd("AT+CFUN?")).place(x=200, y=110, anchor=tk.N)
+    tk.Button(ram, text='AT+CSQ', command=lambda: odeslat_cmd('AT+CSQ')).place(x=290, y=110, anchor=tk.N)
+    tk.Button(ram, text="ATI", command=lambda: odeslat_cmd("ATI")).place(x=420, y=110, anchor=tk.N)
+    tk.Button(ram, text="AT+GMI", command=lambda: odeslat_cmd("AT+GMI")).place(x=470, y=110, anchor=tk.N)
 
-    # ještě není AT + QCFG = "nwscanseq" Configure RAT Searching Sequence
-    # tam je AT + QCFG = "iotopmode" Configure Network Category to be Searched under LTE RAT
-    # tam je AT+QCSQ  Query and Report Signal Strength RSRP
+    # Třetí řada tlačítek
+    tk.Button(ram, text="AT+GSN", command=lambda: odeslat_cmd("AT+GSN")).place(x=200, y=140, anchor=tk.N)
+    tk.Button(ram, text="AT+GMM", command=lambda: odeslat_cmd("AT+GMM")).place(x=270, y=140, anchor=tk.N)
+    tk.Button(ram, text="AT+CGMM", command=lambda: odeslat_cmd("AT+CGMM")).place(x=340, y=140, anchor=tk.N)
+    tk.Button(ram, text="AT+CGMI", command=lambda: odeslat_cmd("AT+CGMI")).place(x=420, y=140, anchor=tk.N)
 
-    # je, ale nefunguje možná vynechat?  AT + QCFG = "band" Band Configuration
-    # je AT + QNWINFO Query Network Information
-    # ještě není AT + QCFG = "nb/bandprior" * Configure Band Scan Priority under NB - IoT
-    # NB-IoT moc nevím, co to vlastně dělá, asi jen něco vrací podle návodu
-    # ještě není AT + QCFG = "nccconf" Configure NB - IoT Features
+    # Čtvrtá řada tlačítek - SPECIÁLNÍ PŘÍKAZY S FRONTOU
+    tk.Button(ram, text="AT+QIOPEN", command=lambda: odeslat_cmd_special('AT+QIOPEN=2,2,"TCP","62.245.74.185",7010')).place(
+        x=200, y=170, anchor=tk.N)
 
-    # je AT + COPS Operator Selection
-    # AT+CEREG 4 pokud je v PSM módu, mám implementovat i všechny tři PSM módy?
-    # ještě není AT + CEDRXS e - I - DRX Setting
-    # ještě není AT + CEDRXRDP Read Dynamic Parameters
+    # toto asi nutno zakomentovat, pokud není, nainstalován Pilow, zobrazuje obrázek modemu i následující odstavec
+    # ---- OBRÁZEK DESKY ----
+    # Načtení a zmenšení obrázku
+    img = Image.open("board.jpg")  # Změňte na název vašeho souboru
+    img = img.resize((250, 200))  # Přizpůsobte velikost dle potřeby
+    img_tk = ImageTk.PhotoImage(img)
 
-    # ještě není ECL level AT+QCFG="celevel" – některé verze firmware umožňují číst aktuální Coverage Enhancement Level., AT+QCFG="iotopmode" – nastavuje/čte režim (NB‑IoT, LTE‑M).
+    # Vytvoření labelu s obrázkem
+    obrazek_label = tk.Label(root, image=img_tk)
+    obrazek_label.image = img_tk  # Udržet referenci!
+    obrazek_label.place(x=750, y=60)  # Umístění vpravo nahoře pod lištu a nad odpovědi
 
-    # Spustí smyčku Thinker
     root.mainloop()
 
 
 if __name__ == "__main__":
-    try:
-        #odesli_socket()
-        main()
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    main()
